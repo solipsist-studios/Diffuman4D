@@ -5,7 +5,6 @@ import torch
 import numpy as np
 import open3d as o3d
 from PIL import Image
-from plyfile import PlyData, PlyElement
 from torchvision.transforms.functional import to_tensor
 from easyvolcap.utils.easy_utils import read_camera
 from easyvolcap.utils.console_utils import tqdm
@@ -37,40 +36,12 @@ def load_binary_mask(mask_path: str):
     return m
 
 
-def save_pcd_ply(path: str, pts: np.ndarray, colors: np.ndarray = None):
-    """
-    Save a point cloud as a PLY file.
-    Args:
-        path: str
-        pts: (N,3) float32
-        colors: (N,3) uint8 or [0,255]
-    """
-
-    if colors is None:
-        colors = np.ones_like(pts, dtype=np.uint8) * 255
-
-    vertex = np.empty(
-        len(pts),
-        dtype=[
-            ("x", "f4"),
-            ("y", "f4"),
-            ("z", "f4"),
-            ("red", "u1"),
-            ("green", "u1"),
-            ("blue", "u1"),
-        ],
-    )
-
-    vertex["x"] = pts[:, 0]
-    vertex["y"] = pts[:, 1]
-    vertex["z"] = pts[:, 2]
-    vertex["red"] = colors[:, 0]
-    vertex["green"] = colors[:, 1]
-    vertex["blue"] = colors[:, 2]
-
+def save_pcd(path, pts_torch):
+    pts = pts_torch.detach().cpu().numpy()
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    ply = PlyData([PlyElement.describe(vertex, "vertex")], text=False)
-    ply.write(path)
+    o3d.io.write_point_cloud(path, pcd)
 
 
 @torch.no_grad()
@@ -161,6 +132,7 @@ def main(
     voxel_size: float = 0.025,
     batch_size: int = 1e6,
     min_views: int = None,
+    save_nerfstudio_pcd: bool = True,
     device: str = "cuda",
 ):
     """
@@ -213,22 +185,16 @@ def main(
     H, W = fmasks[0].shape
     fmasks = torch.stack(fmasks, dim=0).reshape(len(frm_labels), len(cam_labels), H, W)
 
-    bounds_min = np.inf * np.ones(3)
-    bounds_max = -np.inf * np.ones(3)
-
     for i, frm_label in tqdm(enumerate(frm_labels), total=len(frm_labels), desc="Carving visual hulls"):
         hull_pts = carve_visual_hull(
             fmasks[i], P, bounds, voxel_size=voxel_size, batch_size=batch_size, min_views=min_views, device=device
         )
-        hull_pts = hull_pts.float().detach().cpu().numpy()
-        save_pcd_ply(os.path.join(out_vhull_dir, f"{frm_label}.ply"), hull_pts)
 
-        # update bounds
-        bounds_min = np.minimum(bounds_min, hull_pts.min(axis=0))
-        bounds_max = np.maximum(bounds_max, hull_pts.max(axis=0))
+        save_pcd(os.path.join(out_vhull_dir, f"{frm_label}.ply"), hull_pts)
 
-    with open(f"{out_vhull_dir}_bounds.json", "w") as f:
-        json.dump([bounds_min.tolist(), bounds_max.tolist()], f)
+        if i == 0 and save_nerfstudio_pcd:
+            out_pcd_dir = os.path.dirname(cameras_path) if cameras_path.endswith(".json") else cameras_path
+            save_pcd(f"{out_pcd_dir}/sparse_pcd.ply", hull_pts)
 
 
 if __name__ == "__main__":
