@@ -8,7 +8,7 @@ IMAGE_EXT=".webp"
 CAMERA_FORMAT="{0:04d}"
 CAMERA_COUNT=12
 ACTIONS=()
-ALL_ACTIONS=("remove_background" "predict_keypoints" "triangulate_skeleton" "draw_skeleton")
+ALL_ACTIONS=("remove_background" "carve_vhull" "predict_keypoints" "triangulate_skeleton" "draw_skeleton")
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -66,6 +66,13 @@ for act in "${ACTIONS[@]}"; do
         --model_name ZhengPeng7/BiRefNet \
         --image_ext "$IMAGE_EXT" \
         --batch_size 8 # decrease it if OOM
+      ;;
+    carve_vhull)
+      conda activate diffuman4d
+      python scripts/preprocess/carve_visual_hull.py \
+        --fmasks_dir "$DATADIR/fmasks" \
+        --cameras_path "$DATADIR/transforms.json" \
+        --out_vhull_dir "$DATADIR/surfs"
       ;;
     predict_keypoints)
       # it is recommend to use a seperate conda environment to run sapiens-lite
