@@ -32,12 +32,25 @@ def parse_cameras(camera_path: str, coord_system: str = "opencv", normalize_scen
 
         # Load camera intrinsic and extrinsic
         for cam in cams:
-            if "fl_x" in cam and "fl_y" in cam and "cx" in cam and "cy" in cam:
-                fx, fy, cx, cy = cam["fl_x"], cam["fl_y"], cam["cx"], cam["cy"]
-            else:
-                fx, fy, cx, cy = tfs["fl_x"], tfs["fl_y"], tfs["cx"], tfs["cy"]
+            # Load intrinsics with fallback to global values
+            fx = cam.get("fl_x", tfs.get("fl_x"))
+            fy = cam.get("fl_y", tfs.get("fl_y"))
+            cx = cam.get("cx", tfs.get("cx"))
+            cy = cam.get("cy", tfs.get("cy"))
+            k1 = cam.get("k1", tfs.get("k1", 0.0))
+            k2 = cam.get("k2", tfs.get("k2", 0.0))
+            k3 = cam.get("k3", tfs.get("k3", 0.0))
+            k4 = cam.get("k4", tfs.get("k4", 0.0))
+            p1 = cam.get("p1", tfs.get("p1", 0.0))
+            p2 = cam.get("p2", tfs.get("p2", 0.0))
+            h = cam.get("h", tfs.get("h"))
+            w = cam.get("w", tfs.get("w"))
+            
+            # Ensure we have the required intrinsics
+            if any(x is None for x in [fx, fy, cx, cy]):
+                raise ValueError("Missing required camera intrinsics. Each camera must have fl_x, fl_y, cx, cy either globally or per-frame.")
             Ks.append(torch.tensor([fx, 0, cx, 0, fy, cy, 0, 0, 1]).reshape(3, 3))
-            hws.append((cam["h"], cam["w"]))
+            hws.append((h, w))
 
             pose = torch.tensor(cam["transform_matrix"])
             pose[:3, 1:3] *= -1  # convert to opencv as default

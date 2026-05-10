@@ -18,6 +18,13 @@ from typing import List, Optional, Sequence, Union
 from tqdm import tqdm
 from glob import glob
 
+vipsbin = r'C:\vips-dev-8.17\bin'
+add_dll_dir = getattr(os, 'add_dll_directory', None)
+if callable(add_dll_dir):
+    add_dll_dir(vipsbin)
+else:
+    os.environ['PATH'] = os.pathsep.join((vipsbin, os.environ['PATH']))
+
 from adhoc_image_dataset import AdhocImageDataset
 from classes_and_palettes import (
     COCO_KPTS_COLORS,
@@ -83,6 +90,17 @@ def img_save_and_vis(
     thickness,
     save_image,
 ):
+    """
+    Save keypoints and optionally visualize them on the image.
+    
+    This function handles remapping keypoints from the model's input space (e.g., 1024x1024)
+    back to the original image coordinates using the bbox transformation parameters.
+    
+    The remapping formula: keypoints = (keypoints / input_shape) * scale + center - 0.5 * scale
+    - Normalizes keypoints to [0, 1] range
+    - Scales to bbox dimensions
+    - Translates to bbox position in original image
+    """
     # pred_instances_list = split_instances(result)
     heatmap = results["heatmaps"]
     centres = results["centres"]
@@ -99,6 +117,7 @@ def img_save_and_vis(
         )
 
         keypoints, keypoint_scores = result
+        # Remap keypoints from model input space back to original image coordinates
         keypoints = (keypoints / input_shape) * scales[i] + centres[i] - 0.5 * scales[i]
         instance_keypoints.append(keypoints[0])
         instance_scores.append(keypoint_scores[0])
@@ -125,7 +144,7 @@ def img_save_and_vis(
 
     # ? draw on grey background. it will be mapped to 0.0 in diffusion models
     img = np.ones_like(img) * 0.5
-    # img = pyvips.Image.new_from_array(img)
+    #img = pyvips.Image.new_from_array(img)
     instance_keypoints = np.array(instance_keypoints).astype(np.float32)
     instance_scores = np.array(instance_scores).astype(np.float32)
 
@@ -224,7 +243,7 @@ def main():
         default=4,
         help="Set number of workers per GPU",
     )
-    parser.add_argument("--gpu_ids", default="0,1", help="Device used for inference")
+    parser.add_argument("--gpu_ids", default="", help="Comma-separated GPU ids. Leave empty for CPU")
     parser.add_argument("--fp16", action="store_true", default=False, help="Model inference dtype")
     parser.add_argument(
         "--det-cat-id",
@@ -269,6 +288,17 @@ def main():
 
     args = parser.parse_args()
 
+    if args.gpu_ids is None or args.gpu_ids == "" or args.gpu_ids.lower() == "none":
+        args.gpu_ids = []
+        device_list = ["cpu"]
+    else:
+        args.gpu_ids = [int(i) for i in args.gpu_ids.split(",")]
+        device_list = [f"cuda:{i}" for i in args.gpu_ids]
+
+    # use num_gpus = len(args.gpu_ids) or 1 for CPU fallback
+    num_gpus = len(args.gpu_ids) if len(args.gpu_ids) > 0 else 1
+    args.num_workers = args.num_workers * num_gpus
+
     if args.det_config is None or args.det_config == "":
         use_det = False
     else:
@@ -296,49 +326,58 @@ def main():
 
     torch._inductor.config.force_fuse_int_mm_with_mul = True
     torch._inductor.config.use_mixed_mm = True
-    args.gpu_ids = [int(i) for i in args.gpu_ids.split(",")]
-    num_gpus = len(args.gpu_ids)
+    # args.gpu_ids was normalized earlier to a list (possibly empty for CPU).
+    num_gpus = len(args.gpu_ids) if isinstance(args.gpu_ids, list) and len(args.gpu_ids) > 0 else 1
     args.num_workers = args.num_workers * num_gpus
 
     detectors = []
     pose_estimators = []
 
-    for i in args.gpu_ids:
+    for device in device_list:
         # build detector
         if use_det:
-            detector = init_detector(args.det_config, args.det_checkpoint, device=f"cuda:{i}")
+            detector = init_detector(args.det_config, args.det_checkpoint, device=device)
             detector.cfg = adapt_mmdet_pipeline(detector.cfg)
             detectors.append(detector)
-
+        
         # build pose estimator
         USE_TORCHSCRIPT = "_torchscript" in args.pose_checkpoint
+
         # build the model from a checkpoint file
         pose_estimator = load_model(args.pose_checkpoint, USE_TORCHSCRIPT)
-        ## no precision conversion needed for torchscript. run at fp32
-        if not USE_TORCHSCRIPT:
-            dtype = torch.half if args.fp16 else torch.bfloat16
-            pose_estimator.to(dtype)
-            pose_estimator = torch.compile(pose_estimator, mode="max-autotune", fullgraph=True)
-        else:
-            dtype = torch.float32  # TorchScript models use float32
-            pose_estimator = pose_estimator.to(device=f"cuda:{i}")
+
+        if device.startswith("cuda"):
+            if not USE_TORCHSCRIPT:
+                dtype = torch.half if args.fp16 else torch.bfloat16
+                pose_estimator.to(dtype)
+                pose_estimator = torch.compile(pose_estimator, mode="max-autotune", fullgraph=True)
+            else:
+                dtype = torch.float32
+                pose_estimator = pose_estimator.to(device=device)
+        else: # CPU path
+            dtype = torch.float32
+            pose_estimator = pose_estimator.to("cpu")
+            # do not call torch.compile for CPU if it causes issues
+
         pose_estimators.append(pose_estimator)
 
-    # hard code the image extension
-    image_paths = sorted(
-        glob(f"{args.images_dir}/**/*.jpg", recursive=True) + glob(f"{args.images_dir}/**/*.webp", recursive=True)
-    )
+    # Use the requested image extension (default: .jpg)
+    image_ext = args.image_ext
+    if not image_ext.startswith("."):
+        image_ext = f".{image_ext}"
+
+    image_paths = sorted(glob(f"{args.images_dir}/**/*{image_ext}", recursive=True))
     if args.fmasks_dir is not None and args.fmasks_dir != "None":
         fmask_paths = sorted(glob(f"{args.fmasks_dir}/**/*.png", recursive=True))
     else:
         fmask_paths = None
 
-    assert fmask_paths is None or len(image_paths) == len(
-        fmask_paths
-    ), "image_paths and fmask_paths must have the same length to enable background removal"
+    assert fmask_paths is None or len(image_paths) == len(fmask_paths
+       ), "image_paths and fmask_paths must have the same length to enable background removal"
 
     scale = args.heatmap_scale
     # do not provide preprocess args for detector as we use mmdet
+    # Load images at original resolution - bbox cropping and resizing happens per-person later
     inference_dataset = AdhocImageDataset(image_paths, fmask_paths)
 
     KPTS_COLORS = COCO_WHOLEBODY_KPTS_COLORS  ## 133 keypoints
@@ -354,16 +393,20 @@ def main():
     def process_single_batch(idx):
         # get model and data
         gpu_idx = idx % num_gpus
-        device = f"cuda:{args.gpu_ids[gpu_idx]}"
-        detector = detectors[gpu_idx]
+        # pick device from device_list (may be ['cpu'] or list of 'cuda:i')
+        device = device_list[gpu_idx]
+        detector = detectors[gpu_idx] if use_det else None
         pose_estimator = pose_estimators[gpu_idx]
 
         image_path, orig_img = inference_dataset[idx]
 
         # ? we add the cam_label here to fit the easyvolcap data format
-        output_path = osp.join(args.output_dir, "/".join(image_path.split("/")[-2:]))
+        # Use os.path.split to handle platform-agnostic path splitting
+        path_parts = osp.normpath(image_path).split(osp.sep)
+        output_path = osp.normpath(osp.join(args.output_dir, *path_parts[-2:]))
         args.image_ext = osp.splitext(image_path)[1]
         output_json_path = output_path.replace(args.image_ext, ".json")
+
         if args.skip_exists and osp.exists(output_json_path):
             try:
                 json.load(open(output_json_path))

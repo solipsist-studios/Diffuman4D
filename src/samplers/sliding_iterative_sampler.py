@@ -3,6 +3,8 @@ from tqdm import tqdm
 from threading import Lock
 from functools import partial
 from collections import defaultdict
+import traceback
+import gc
 
 from src.data.spatem_dataset import SpaTemDataset
 from src.diffusers.pipelines.diffuman4d.pipeline_diffuman4d import Diffuman4DPipeline
@@ -47,22 +49,22 @@ class SlidingIterativeSampler:
 
         # sampling range args
         if spa_labels is not None:
-            self.spa_labels = [f"{int(i):02d}" for i in spa_labels]
+            self.spa_labels = [self.dataset.format_spa_label(int(i)) for i in spa_labels]
         elif spa_label_range is not None:
             b, e, s = spa_label_range
-            self.spa_labels = [f"{int(i):02d}" for i in range(b, e, s)]
+            self.spa_labels = [self.dataset.format_spa_label(int(i)) for i in range(b, e, s)]
         else:
             raise ValueError("spa_labels or spa_label_range must be provided")
 
         if tem_labels is not None:
-            self.tem_labels = [f"{int(i):06d}" for i in tem_labels]
+            self.tem_labels = [self.dataset.format_tem_label(int(i)) for i in tem_labels]
         elif tem_label_range is not None:
             b, e, s = tem_label_range
-            self.tem_labels = [f"{int(i):06d}" for i in range(b, e, s)]
+            self.tem_labels = [self.dataset.format_tem_label(int(i)) for i in range(b, e, s)]
         else:
             raise ValueError("tem_labels or tem_label_range must be provided")
 
-        self.input_spa_labels = [f"{int(i):02d}" for i in input_spa_labels]
+        self.input_spa_labels = [self.dataset.format_spa_label(int(i)) for i in input_spa_labels]
         self.target_spa_labels = [label for label in self.spa_labels if label not in self.input_spa_labels]
         log.info(
             f"Found {len(self.spa_labels)} spatial labels, {len(self.input_spa_labels)} input spatial labels, {len(self.tem_labels)} temporal labels."
@@ -157,6 +159,30 @@ class SlidingIterativeSampler:
         pipeline = self.pipelines[pipe_idx]
         task_label = f"alt{sample['alt']}_{'spa' if sample['domain'] == 'temporal' else 'tem'}{sample['domain_label']}"
 
+        # Aggressive garbage collection before denoising to free memory
+        # gc.collect()
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
+        #     torch.cuda.reset_peak_memory_stats()
+
+        # Adaptive window sizing based on available GPU memory
+        if torch.cuda.is_available():
+            mem_free, mem_total = torch.cuda.mem_get_info(pipe_idx)
+            mem_free_gb = mem_free / (1024**3)
+            mem_total_gb = mem_total / (1024**3)
+            
+            # Calculate effective window size based on available memory
+            if mem_free_gb < 6:
+                effective_window = max(4, self.window_size // 3)
+                log.warning(f"Low GPU memory ({mem_free_gb:.1f}/{mem_total_gb:.1f}GB). Reducing window {self.window_size} -> {effective_window}")
+            elif mem_free_gb < 10:
+                effective_window = max(6, self.window_size // 2)
+                log.warning(f"Moderate GPU memory ({mem_free_gb:.1f}/{mem_total_gb:.1f}GB). Reducing window {self.window_size} -> {effective_window}")
+            else:
+                effective_window = self.window_size
+        else:
+            effective_window = self.window_size
+
         # denoise a spatial or temporal sample sequence
         result = pipeline.sliding_iterative_denoise(
             pixel_values=sample["pixel_values"],
@@ -187,6 +213,13 @@ class SlidingIterativeSampler:
         sample["images"] = result["images"].float().cpu()
         sample["timestep_indices"] = result["timestep_indices"].cpu()
         sample["fully_denoised"] = result["fully_denoised"].cpu()
+        
+        # Free GPU memory immediately
+        del result
+        torch.cuda.empty_cache()
+        # Also force Python garbage collection to release unreferenced objects
+        gc.collect()
+        
         return sample
 
     def prepare_tasks(self):
@@ -199,14 +232,52 @@ class SlidingIterativeSampler:
             self.all_tasks.append(tasks)
 
     def execute_one_task(self, task: dict, pipe_idx: int = 0):
-        sample = self.load_sample(**task)
-        sample = self.denoise(sample, pipe_idx=pipe_idx)
-        save_sampling_results(sample, output_dir=self.output_dir)
+        try:
+            log.debug(f"Starting task: {task} on pipeline {pipe_idx}")
+            
+            # Log GPU memory before starting
+            if torch.cuda.is_available():
+                gpu_mem = torch.cuda.memory_allocated(pipe_idx) / 1024**3
+                gpu_mem_reserved = torch.cuda.memory_reserved(pipe_idx) / 1024**3
+                log.debug(f"GPU {pipe_idx} memory: {gpu_mem:.2f}GB allocated, {gpu_mem_reserved:.2f}GB reserved")
+            
+            sample = self.load_sample(**task)
+            log.debug(f"Loaded sample for task: {task}")
+            sample = self.denoise(sample, pipe_idx=pipe_idx)
+            log.debug(f"Denoising complete for task: {task}")
+            save_sampling_results(sample, output_dir=self.output_dir)
+            log.debug(f"Successfully completed task: {task}")
+            
+            # Free CPU memory after saving
+            del sample["images"]
+            del sample["pixel_values"]
+            if "skeletons" in sample:
+                del sample["skeletons"]
+            
+            # Log GPU memory after cleanup
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gpu_mem = torch.cuda.memory_allocated(pipe_idx) / 1024**3
+                gpu_mem_reserved = torch.cuda.memory_reserved(pipe_idx) / 1024**3
+                log.debug(f"GPU {pipe_idx} memory after cleanup: {gpu_mem:.2f}GB allocated, {gpu_mem_reserved:.2f}GB reserved")
+            
+        except Exception as e:
+            log.error(f"Error executing task {task}: {str(e)}")
+            log.error(f"Full traceback:\n{traceback.format_exc()}")
+            raise
 
     def execute_tasks(self):
-        for tasks in self.all_tasks:
-            for task in tasks:
-                self.execute_one_task(task)
+        for i, tasks in enumerate(self.all_tasks):
+            log.info(f"Starting task group {i+1}/{len(self.all_tasks)} with {len(tasks)} tasks")
+            for j, task in enumerate(tasks):
+                try:
+                    log.debug(f"Executing task {j+1}/{len(tasks)}: {task}")
+                    self.execute_one_task(task)
+                except Exception as e:
+                    log.error(f"Failed on task {j+1}/{len(tasks)}: {task}")
+                    log.error(f"Error: {str(e)}")
+                    log.error(f"Full traceback:\n{traceback.format_exc()}")
+                    raise
 
         if not check_sampling_results(self.spa_labels, self.tem_labels, self.output_dir):
             raise ValueError("Sampling failed.")

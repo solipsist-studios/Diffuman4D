@@ -14,6 +14,7 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 from copy import deepcopy
 from tqdm import tqdm
+import gc
 
 import torch
 
@@ -61,18 +62,29 @@ def decode_vae(vae, latents, generator=None, batch_size=8):
     latents_batches = latents.split(batch_size)
     # Decode the latents in batches
     images = []
-    for latents in latents_batches:
-        out = vae.decode(
-            latents / vae.config.scaling_factor,
-            return_dict=False,
-            generator=generator,
-        )[0]
-        images.append(out)
-    images = torch.cat(images, dim=0)
-    return images
+    try:
+        for i, latents_batch in enumerate(tqdm(latents_batches, desc="Decoding VAE")):
+            out = vae.decode(
+                latents_batch / vae.config.scaling_factor,
+                return_dict=False,
+                generator=generator,
+            )[0]
+            # Move to CPU immediately to free GPU memory
+            images.append(out.cpu())
+            del out
+            # Clear GPU cache after each batch
+            torch.cuda.empty_cache()
+        # Concatenate on CPU
+        images = torch.cat(images, dim=0)
+        # Move back to GPU if needed for post-processing
+        images = images.to(vae.device)
+        return images
+    except Exception as e:
+        logger.error(f"Error during VAE decoding at batch {i}/{len(latents_batches)}: {str(e)}")
+        raise
 
 
-def encode_image_vae(vae, images, image_latents=None, dtype=None, device=None):
+def encode_image_vae(vae, images, image_latents=None, dtype=None, device=None, batch_size=8):
     dtype = vae.dtype if dtype is None else dtype
     device = vae.device if device is None else device
 
@@ -80,7 +92,7 @@ def encode_image_vae(vae, images, image_latents=None, dtype=None, device=None):
         if images is None:
             return None
         images = images.to(dtype=dtype, device=device)
-        image_latents = encode_vae(vae, images)
+        image_latents = encode_vae(vae, images, batch_size=batch_size)
     else:
         image_latents = image_latents.to(dtype=dtype, device=device)
 
@@ -138,6 +150,7 @@ class Diffuman4DPipeline(
         self.register_modules(vae=vae, unet=unet, scheduler=scheduler)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.vae_batch_size = 8
 
     @property
     def guidance_scale(self):
@@ -211,6 +224,7 @@ class Diffuman4DPipeline(
             image_latents=pixel_values_latents,
             dtype=dtype,
             device=device,
+            batch_size=self.vae_batch_size
         )
         num_frames, latent_dim, height, width = pixel_values_latents.shape
 
@@ -236,6 +250,7 @@ class Diffuman4DPipeline(
                 image_latents=skeletons_latents,
                 dtype=dtype,
                 device=device,
+                batch_size=self.vae_batch_size,
             )
 
         # conditional masks
@@ -278,7 +293,7 @@ class Diffuman4DPipeline(
         return timestep
 
     def post_process(self, latents, output_type="pt", generator=None):
-        images = decode_vae(self.vae, latents, generator=generator)
+        images = decode_vae(self.vae, latents, generator=generator, batch_size=self.vae_batch_size)
         images = self.image_processor.postprocess(
             images, output_type=output_type, do_denormalize=[True] * images.shape[0]
         )
@@ -421,6 +436,11 @@ class Diffuman4DPipeline(
                     new_latents.append(latent.to(dtype=dtype))
                 latents = torch.cat(new_latents)
                 timestep_indices[~is_cond] += 1
+                
+                # Clean up intermediate tensors
+                del noise_pred, new_latents
+                if self.do_classifier_free_guidance:
+                    del latent_model_input
 
                 progress_bar.update()
 
@@ -496,6 +516,12 @@ class Diffuman4DPipeline(
                 latents=latents,
             )
         )
+        
+        # Free the original input tensors since we now have latents
+        del pixel_values, plucker_embeds, cond_masks
+        if skeletons is not None and not self.unet.config.enable_pose_encoder:
+            del skeletons
+        torch.cuda.empty_cache()
 
         # prepare schedulers
         schedulers, timesteps = self.parepare_schedulers(num_inference_steps, len(latents))
@@ -541,6 +567,12 @@ class Diffuman4DPipeline(
             # update latents and timesteps
             timestep_indices[target_window] += num_denoising_steps
             latents[window] = latents_window
+            
+            # Aggressive memory cleanup after each window to prevent fragmentation
+            del latents_window
+            # torch.cuda.empty_cache()
+            # # Also force Python garbage collection to release unreferenced objects
+            # gc.collect()
 
         # sanity check
         if (timestep_indices[target_indices] != timestep_id_end).any():

@@ -20,20 +20,30 @@ class SpaTemDataset(Dataset):
         self,
         data_dir: str,
         camera_path_pat: str = "{data_dir}/{scene_label}/transforms.json",
-        image_path_pat: str = "{data_dir}/{scene_label}/images/{spa_label}/{tem_label}.webp",
+        image_path_pat: str = "{data_dir}/{scene_label}/images/{spa_label}/{tem_label}.{image_ext}",
+        image_ext: str = "webp",
         fmask_path_pat: str = "{data_dir}/{scene_label}/fmasks/{spa_label}/{tem_label}.png",
         skeleton_path_pat: str = "{data_dir}/{scene_label}/skeletons/{spa_label}/{tem_label}.webp",
         scene_label: list[str] | None = None,
+        spa_label_format: str | None = None,
+        spa_label_prefix: str = "",
+        tem_label_format: str | None = None,
+        tem_label_prefix: str = "",
         height: int = 1024,
         width: int = 1024,
         has_gt_target: bool = True,  # if False, use skeleton as image and fmask for target samples
     ):
         self.data_dir = data_dir
         self.camera_path_pat = camera_path_pat
-        self.image_path_pat = image_path_pat
+        self.image_ext = image_ext
         self.fmask_path_pat = fmask_path_pat
         self.skeleton_path_pat = skeleton_path_pat
         self.scene_label = scene_label
+        self.spa_label_format = spa_label_format
+        self.spa_label_prefix = spa_label_prefix
+        self.tem_label_format = tem_label_format
+        self.tem_label_prefix = tem_label_prefix
+        self.image_path_pat = image_path_pat
 
         if "$" in self.data_dir:
             self.data_dir = osp.expandvars(self.data_dir)
@@ -50,8 +60,22 @@ class SpaTemDataset(Dataset):
         self.width = width
         self.has_gt_target = has_gt_target
 
-    def get_file_path(self, pat: str, scene_label: str, spa_label: str, tem_label: str) -> str:
-        return pat.format(data_dir=self.data_dir, scene_label=scene_label, spa_label=spa_label, tem_label=tem_label)
+    def format_spa_label(self, i: int) -> str:
+        if self.spa_label_format is not None:
+            return self.spa_label_format.format(i)
+        else:
+            return f"{self.spa_label_prefix}{int(i):02d}"
+
+    def format_tem_label(self, i: int) -> str:
+        if self.tem_label_format is not None:
+            return self.tem_label_format.format(i)
+        else:
+            return f"{self.tem_label_prefix}{int(i):06d}"
+
+    def get_file_path(self, pat: str, scene_label: str, spa_label: str, tem_label: str, **kwargs) -> str:
+        return pat.format(
+            data_dir=self.data_dir, scene_label=scene_label, spa_label=spa_label, tem_label=tem_label, **kwargs
+        )
 
     def transform_image(self, image: Image.Image, crop: tuple[int, int, int, int]) -> torch.Tensor:
         # crop and resize the image
@@ -115,7 +139,9 @@ class SpaTemDataset(Dataset):
         Ks, poses, hws, crops = [], [], [], []
         for i, label in enumerate(labels):
             scene_label, spa_label, tem_label = label
-            image_path = self.get_file_path(self.image_path_pat, scene_label, spa_label, tem_label)
+            image_path = self.get_file_path(
+                self.image_path_pat, scene_label, spa_label, tem_label, image_ext=self.image_ext
+            )
             fmask_path = self.get_file_path(self.fmask_path_pat, scene_label, spa_label, tem_label)
             skeleton_path = self.get_file_path(self.skeleton_path_pat, scene_label, spa_label, tem_label)
 
