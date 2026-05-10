@@ -1,0 +1,604 @@
+import argparse
+import json
+import os
+import pickle
+import re
+from pathlib import Path
+
+import numpy as np
+from hloc import extract_features, match_features, reconstruction, pairs_from_exhaustive
+import pycolmap
+
+def load_camera_from_transforms(transforms: dict) -> pycolmap.Camera:
+    width = transforms.get('w', transforms.get('width'))
+    height = transforms.get('h', transforms.get('height'))
+    fl_x = transforms.get('fl_x')
+    fl_y = transforms.get('fl_y', fl_x)
+    cx = transforms.get('cx')
+    cy = transforms.get('cy')
+
+    required = {
+        'w/width': width,
+        'h/height': height,
+        'fl_x': fl_x,
+        'fl_y': fl_y,
+        'cx': cx,
+        'cy': cy,
+    }
+    missing = [key for key, value in required.items() if value is None]
+    if missing:
+        raise ValueError(
+            f"Missing required camera intrinsics: {', '.join(missing)}"
+        )
+
+    camera_model = str(transforms.get('camera_model', 'PINHOLE')).upper()
+
+    if camera_model == 'SIMPLE_PINHOLE':
+        params = [
+            float(fl_x),
+            float(cx),
+            float(cy),
+        ]
+    elif camera_model == 'PINHOLE':
+        params = [
+            float(fl_x),
+            float(fl_y),
+            float(cx),
+            float(cy),
+        ]
+    elif camera_model == 'SIMPLE_RADIAL':
+        params = [
+            float(fl_x),
+            float(cx),
+            float(cy),
+            float(transforms.get('k1', 0.0)),
+        ]
+    elif camera_model == 'RADIAL':
+        params = [
+            float(fl_x),
+            float(cx),
+            float(cy),
+            float(transforms.get('k1', 0.0)),
+            float(transforms.get('k2', 0.0)),
+        ]
+    elif camera_model == 'OPENCV':
+        params = [
+            float(fl_x),
+            float(fl_y),
+            float(cx),
+            float(cy),
+            float(transforms.get('k1', 0.0)),
+            float(transforms.get('k2', 0.0)),
+            float(transforms.get('p1', 0.0)),
+            float(transforms.get('p2', 0.0)),
+        ]
+    elif camera_model == 'OPENCV_FISHEYE':
+        params = [
+            float(fl_x),
+            float(fl_y),
+            float(cx),
+            float(cy),
+            float(transforms.get('k1', 0.0)),
+            float(transforms.get('k2', 0.0)),
+            float(transforms.get('k3', 0.0)),
+            float(transforms.get('k4', 0.0)),
+        ]
+    else:
+        raise ValueError(
+            f"Unsupported camera_model '{camera_model}'. "
+            "Supported models: SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, OPENCV_FISHEYE"
+        )
+
+    return pycolmap.Camera(
+        model=camera_model,
+        width=int(width),
+        height=int(height),
+        params=params,
+    )
+
+
+def _infer_camera_model(model: str | None, dist: np.ndarray) -> str:
+    supported = {'OPENCV', 'OPENCV_FISHEYE', 'PINHOLE'}
+    if model in supported:
+        return model
+    return 'OPENCV_FISHEYE' if dist.size == 4 else 'OPENCV'
+
+
+def _infer_image_size(images_dir: Path) -> tuple[int, int]:
+    """Return (width, height) of the first readable image found under images_dir."""
+    from PIL import Image  # lazy import — only needed when size must be inferred
+    supported = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
+    for path in sorted(images_dir.rglob('*')):
+        if path.is_file() and path.suffix.lower() in supported:
+            try:
+                with Image.open(path) as img:
+                    return img.width, img.height
+            except Exception:
+                continue
+    raise FileNotFoundError(
+        f'No readable images found under {images_dir} to infer image dimensions.'
+    )
+
+
+def _camera_name_score(name: str) -> int:
+    normalized = name.strip().lower()
+    if not normalized:
+        return -1
+
+    score = 0
+    if 'camera' in normalized or normalized.startswith('cam'):
+        score += 3
+    if 'frame' in normalized:
+        score -= 3
+    if re.search(r'cam(?:era)?[_-]?\d+', normalized):
+        score += 2
+    if re.search(r'frame[_-]?\d+', normalized):
+        score -= 2
+    return score
+
+
+def _resolve_camera_export_name(
+    image_name: str,
+    camera_name_source: str,
+) -> tuple[str, str]:
+    image_path = Path(image_name)
+    directory_candidate = image_path.parent.name
+    filename_candidate = image_path.stem
+
+    if camera_name_source == 'directory':
+        camera_label = directory_candidate or filename_candidate
+    elif camera_name_source == 'filename':
+        camera_label = filename_candidate
+    else:
+        directory_score = _camera_name_score(directory_candidate)
+        filename_score = _camera_name_score(filename_candidate)
+        if directory_score > filename_score:
+            camera_label = directory_candidate
+        else:
+            camera_label = filename_candidate
+
+    if not camera_label:
+        camera_label = filename_candidate
+
+    output_suffix = image_path.suffix
+    output_file_name = f'{camera_label}{output_suffix}' if output_suffix else camera_label
+    return camera_label, output_file_name
+
+
+def load_transforms_from_pkl(
+    pkl_path: Path,
+    camera_model: str | None = None,
+) -> dict:
+    """Load a calibration .pkl and return a transforms dict compatible with predict_poses.
+
+    w/h are included only when image_size is present in the pkl; otherwise they
+    are omitted and must be filled in by the caller (e.g. from images_dir).
+    """
+    if not pkl_path.exists() or not pkl_path.is_file():
+        raise FileNotFoundError(f'Calibration file does not exist: {pkl_path}')
+    with pkl_path.open('rb') as f:
+        data = pickle.load(f)
+    if not isinstance(data, dict):
+        raise ValueError('Calibration file must contain a dictionary.')
+    if 'camera_matrix' not in data or 'distortion_coefficients' not in data:
+        raise ValueError(
+            'Calibration file is missing required keys: camera_matrix and/or distortion_coefficients.'
+        )
+
+    mtx = np.asarray(data['camera_matrix'], dtype=np.float64)
+    dist = np.asarray(data['distortion_coefficients'], dtype=np.float64).reshape(-1)
+    if mtx.shape != (3, 3):
+        raise ValueError(f'camera_matrix must have shape (3, 3), got {mtx.shape}')
+
+    resolved_model = camera_model or _infer_camera_model(data.get('model'), dist)
+
+    transforms: dict = {
+        'camera_model': resolved_model,
+        'fl_x': float(mtx[0, 0]),
+        'fl_y': float(mtx[1, 1]),
+        'cx': float(mtx[0, 2]),
+        'cy': float(mtx[1, 2]),
+        'frames': [],
+    }
+
+    image_size = data.get('image_size')
+    if image_size is not None and len(image_size) == 2:
+        transforms['w'] = int(image_size[0])
+        transforms['h'] = int(image_size[1])
+
+    if resolved_model == 'OPENCV_FISHEYE':
+        transforms['k1'] = float(dist[0]) if dist.size > 0 else 0.0
+        transforms['k2'] = float(dist[1]) if dist.size > 1 else 0.0
+        transforms['k3'] = float(dist[2]) if dist.size > 2 else 0.0
+        transforms['k4'] = float(dist[3]) if dist.size > 3 else 0.0
+    elif resolved_model == 'OPENCV':
+        transforms['k1'] = float(dist[0]) if dist.size > 0 else 0.0
+        transforms['k2'] = float(dist[1]) if dist.size > 1 else 0.0
+        transforms['p1'] = float(dist[2]) if dist.size > 2 else 0.0
+        transforms['p2'] = float(dist[3]) if dist.size > 3 else 0.0
+
+    return transforms
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description='Run HLOC feature matching and COLMAP reconstruction using camera intrinsics from a transforms.json or calibration .pkl.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Examples:\n'
+            '  python scripts/preprocess/predict_poses.py '
+            '--images_dir data/goprotest/images '
+            '--transforms_json outputs/transforms/goprotest/transforms.json '
+            '--output_transforms outputs/transforms/goprotest/transforms_predicted.json\n\n'
+            '  python scripts/preprocess/predict_poses.py '
+            '--images_dir data/ballet/images '
+            '--calibration_pkl output/calibration_data.pkl '
+            '--output_transforms outputs/transforms/ballet/transforms.json '
+            '--output_calibration outputs/transforms/ballet/calibration_refined.pkl'
+        ),
+    )
+    parser.add_argument(
+        '--images_dir',
+        type=Path,
+        required=True,
+        help='Directory containing input images for HLOC/COLMAP.',
+    )
+    parser.add_argument(
+        '--outputs_dir',
+        type=Path,
+        default=Path('output/hloc_colmap'),
+        help='Directory where pairs, matches, and reconstruction outputs will be written.',
+    )
+
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        '--transforms_json',
+        type=Path,
+        help='Path to transforms.json containing camera_model and intrinsics (fl_x/fl_y/cx/cy and distortion params).',
+    )
+    input_group.add_argument(
+        '--calibration_pkl',
+        type=Path,
+        help='Path to calibration .pkl (camera_matrix + distortion_coefficients) to use as intrinsics source.',
+    )
+
+    parser.add_argument(
+        '--camera_model',
+        type=str,
+        default=None,
+        choices=['PINHOLE', 'OPENCV', 'OPENCV_FISHEYE'],
+        help='Camera model override when using --calibration_pkl. Inferred from distortion count if omitted.',
+    )
+
+    parser.add_argument(
+        '--output_transforms',
+        type=Path,
+        required=True,
+        help='Path to write the output transforms.json with predicted poses and refined intrinsics.',
+    )
+    parser.add_argument(
+        '--output_calibration',
+        type=Path,
+        default=None,
+        help='Optional path to write a calibration .pkl with the refined intrinsics after reconstruction.',
+    )
+    parser.add_argument(
+        '--lock_focus',
+        action='store_true',
+        help='Disable focal length refinement during bundle adjustment.',
+    )
+    parser.add_argument(
+        '--lock_params',
+        action='store_true',
+        help='Disable refinement of extra camera parameters during bundle adjustment.',
+    )
+    parser.add_argument(
+        '--refine_principle_point',
+        action='store_true',
+        help='Enable principal point refinement during bundle adjustment.',
+    )
+    parser.add_argument(
+        '--camera_name_source',
+        type=str,
+        default='auto',
+        choices=['auto', 'directory', 'filename'],
+        help='How to derive the exported camera name from nested COLMAP image paths.',
+    )
+
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    images_dir = args.images_dir
+    outputs_dir = args.outputs_dir
+
+    if not images_dir.exists() or not images_dir.is_dir():
+        raise FileNotFoundError(f'images_dir does not exist or is not a directory: {images_dir}')
+
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    sfm_pairs = outputs_dir / 'pairs-exhaustive.txt'
+    sfm_dir = outputs_dir / 'sfm_reconstruction'
+
+    feature_conf = extract_features.confs['superpoint_aachen']
+    matcher_conf = match_features.confs['superpoint+lightglue']
+
+    # feature_conf = extract_features.confs['aliked-n16']
+    # feature_conf['model']['max_num_keypoints'] = 8192 
+    # matcher_conf = match_features.confs['aliked+lightglue']
+
+    print('Extracting features...')
+    feature_path = extract_features.main(feature_conf, images_dir, outputs_dir)
+
+    print('Generating exhaustive pairs for the rig...')
+    pairs_from_exhaustive.main(sfm_pairs, image_list=None, features=feature_path)
+
+    print('Matching features with LightGlue...')
+    match_path = match_features.main(matcher_conf, sfm_pairs, feature_conf['output'], outputs_dir)
+
+    if args.transforms_json is not None:
+        if not args.transforms_json.exists() or not args.transforms_json.is_file():
+            raise FileNotFoundError(f'transforms_json does not exist: {args.transforms_json}')
+        with args.transforms_json.open('r', encoding='utf-8') as handle:
+            transforms = json.load(handle)
+    else:
+        transforms = load_transforms_from_pkl(
+            args.calibration_pkl,
+            camera_model=args.camera_model,
+        )
+
+    if transforms.get('w') is None or transforms.get('h') is None:
+        print('Image dimensions not found in input — inferring from images_dir...')
+        w, h = _infer_image_size(images_dir)
+        transforms['w'] = w
+        transforms['h'] = h
+        print(f'Inferred image size: {w}x{h}')
+
+    camera_model = load_camera_from_transforms(transforms)
+
+    print("Running COLMAP reconstruction...")
+
+    image_options_dict = {
+        "camera_model": camera_model.model.name,
+        "camera_params": ",".join(str(float(value)) for value in camera_model.params)
+    }
+
+    mapper_options_dict = {
+        "ba_refine_focal_length": not args.lock_focus,
+        "ba_refine_extra_params": not args.lock_params,
+        "ba_refine_principal_point": args.refine_principle_point,
+
+        # General optimizations (for SIFT)
+        #"ba_global_function_tolerance": 1e-6, 
+        #"tri_merge_max_reproj_error": 1.5, # Default is often 4.0. Lowering to 1.5 or 1.0 forces surgical precision.
+        #"ba_global_max_num_iterations": 100, 
+        #"ba_local_max_num_iterations": 50
+    }
+
+    model = reconstruction.main(
+        sfm_dir,
+        images_dir,
+        sfm_pairs,
+        feature_path,
+        match_path,
+        camera_mode=pycolmap.CameraMode.SINGLE, 
+        image_options=image_options_dict,
+        mapper_options=mapper_options_dict
+    )
+
+    print(f"Reconstruction complete! Reconstructed {model.num_reg_images()} images.")
+
+    # Extract the newly refined camera parameters from COLMAP
+    refined_camera = list(model.cameras.values())[0] # Grab the single camera model
+
+    if camera_model.model.name == 'SIMPLE_PINHOLE':
+        fl_x, cx, cy = refined_camera.params
+    
+        transforms["fl_x"] = fl_x
+        transforms["cx"] = cx
+        transforms["cy"] = cy
+
+    elif camera_model.model.name == 'PINHOLE':
+        fl_x, fl_y, cx, cy = refined_camera.params
+
+        transforms["fl_x"] = fl_x
+        transforms["fl_y"] = fl_y
+        transforms["cx"] = cx
+        transforms["cy"] = cy
+
+    elif camera_model.model.name == 'SIMPLE_RADIAL':
+        fl_x, cx, cy, k1 = refined_camera.params
+
+        transforms["fl_x"] = fl_x
+        transforms["cx"] = cx
+        transforms["cy"] = cy
+        transforms["k1"] = k1
+
+    elif camera_model.model.name == 'RADIAL':
+        fl_x, cx, cy, k1, k2 = refined_camera.params
+
+        transforms["fl_x"] = fl_x
+        transforms["cx"] = cx
+        transforms["cy"] = cy
+        transforms["k1"] = k1
+        transforms["k2"] = k2
+
+    elif camera_model.model.name == 'OPENCV':
+        fl_x, fl_y, cx, cy, k1, k2, p1, p2 = refined_camera.params
+
+        transforms["fl_x"] = fl_x
+        transforms["fl_y"] = fl_y
+        transforms["cx"] = cx
+        transforms["cy"] = cy
+        transforms["k1"] = k1
+        transforms["k2"] = k2
+        transforms["p1"] = p1
+        transforms["p2"] = p2
+
+    elif camera_model.model.name == 'OPENCV_FISHEYE':
+        fl_x, fl_y, cx, cy, k1, k2, k3, k4 = refined_camera.params
+
+        transforms["fl_x"] = fl_x
+        transforms["fl_y"] = fl_y
+        transforms["cx"] = cx
+        transforms["cy"] = cy
+        transforms["k1"] = k1
+        transforms["k2"] = k2
+        transforms["k3"] = k3
+        transforms["k4"] = k4
+
+    else:
+        raise ValueError(
+            f"Unsupported camera_model '{camera_model.model.name}'. "
+            "Supported models: SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, OPENCV_FISHEYE"
+        )
+    
+
+    # Extract poses from the PyCOLMAP Reconstruction object
+    # The 'model' variable is what was returned by reconstruction.main()
+    transforms["frames"] = []
+
+    for image_id, image in model.images.items():
+        camera_label, output_file_name = _resolve_camera_export_name(
+            image.name,
+            args.camera_name_source,
+        )
+        
+        # Extract World-to-Camera rotation and translation
+        # (Using the modern PyCOLMAP cam_from_world API)
+        cam_from_world = image.cam_from_world()
+        R_w2c = cam_from_world.rotation.matrix()
+        t_w2c = cam_from_world.translation
+
+        # Convert to Camera-to-World
+        R_c2w = R_w2c.T
+        t_c2w = -np.matmul(R_c2w, t_w2c)
+
+        # Build the 4x4 transformation matrix
+        c2w_matrix = np.eye(4)
+        c2w_matrix[:3, :3] = R_c2w
+        c2w_matrix[:3, 3] = t_c2w
+
+        # Append to our frames list
+        transforms["frames"].append({
+            "file_path": f"images\\{output_file_name}",
+            "camera_label": camera_label,
+            "transform_matrix": c2w_matrix.tolist()
+        })
+
+    # Convert OpenCV -> OpenGL
+    translations = []
+
+    for frame in transforms["frames"]:
+        # Convert list to numpy array for math
+        c2w = np.array(frame["transform_matrix"])
+        
+        # Flip the Y and Z axes to match PostShot/OpenGL expectations
+        c2w[:3, 1] *= -1
+        c2w[:3, 2] *= -1
+        
+        frame["transform_matrix"] = c2w.tolist()
+        translations.append(c2w[:3, 3])
+
+    # Fix the Center Origin (Move the rig center to 0,0,0)
+    translations = np.array(translations)
+    center_of_mass = translations.mean(axis=0)
+
+    for frame in transforms["frames"]:
+        c2w = np.array(frame["transform_matrix"])
+        # Subtract the center of mass from the translation vector
+        c2w[:3, 3] -= center_of_mass
+        frame["transform_matrix"] = c2w.tolist()
+
+
+    # Auto-Align the Up Vector
+    # In our new OpenGL C2W matrices, the second column (index 1) is the camera's local Y-axis (Up)
+    up_vectors = [np.array(frame["transform_matrix"])[:3, 1] for frame in transforms["frames"]]
+    avg_up = np.mean(up_vectors, axis=0)
+    avg_up /= np.linalg.norm(avg_up)  # Normalize the vector
+
+    world_up = np.array([0.0, 1.0, 0.0]) # Standard OpenGL World Up
+
+    # Find the rotation axis and angle needed to align the rig to the world
+    axis = np.cross(avg_up, world_up)
+    axis_norm = np.linalg.norm(axis)
+
+    if axis_norm > 1e-6: # Prevent mathematical errors if already perfectly aligned
+        axis /= axis_norm
+        angle = np.arccos(np.clip(np.dot(avg_up, world_up), -1.0, 1.0))
+        
+        # Build the rotation matrix using Rodrigues' formula
+        K = np.array([
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0]
+        ])
+        R_align = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+        
+        # Apply the global rotation to every camera's translation and orientation
+        for frame in transforms["frames"]:
+            c2w = np.array(frame["transform_matrix"])
+            
+            # Rotate the translation vector
+            c2w[:3, 3] = R_align @ c2w[:3, 3]
+            
+            # Rotate the orientation matrix
+            c2w[:3, :3] = R_align @ c2w[:3, :3]
+            
+            frame["transform_matrix"] = c2w.tolist()
+
+    # 3. Save to disk
+    args.output_transforms.parent.mkdir(parents=True, exist_ok=True)
+    with args.output_transforms.open('w', encoding='utf-8') as f:
+        json.dump(transforms, f, indent=4)
+    print(f"Saved {len(transforms['frames'])} poses to {args.output_transforms}!")
+
+    # 4. Optionally save refined intrinsics back to a calibration .pkl
+    if args.output_calibration is not None:
+        fl_x = transforms['fl_x']
+        fl_y = transforms.get('fl_y', fl_x)
+        cx = transforms['cx']
+        cy = transforms['cy']
+        refined_mtx = np.array([
+            [fl_x,  0.0,  cx],
+            [ 0.0, fl_y,  cy],
+            [ 0.0,  0.0, 1.0],
+        ], dtype=np.float64)
+
+        model_name = transforms.get('camera_model', 'PINHOLE')
+        if model_name == 'OPENCV_FISHEYE':
+            refined_dist = np.array([
+                transforms.get('k1', 0.0),
+                transforms.get('k2', 0.0),
+                transforms.get('k3', 0.0),
+                transforms.get('k4', 0.0),
+            ], dtype=np.float64)
+        elif model_name == 'OPENCV':
+            refined_dist = np.array([
+                transforms.get('k1', 0.0),
+                transforms.get('k2', 0.0),
+                transforms.get('p1', 0.0),
+                transforms.get('p2', 0.0),
+            ], dtype=np.float64)
+        else:
+            refined_dist = np.zeros(4, dtype=np.float64)
+
+        refined_calib = {
+            'camera_matrix': refined_mtx,
+            'distortion_coefficients': refined_dist,
+            'image_size': (transforms.get('w'), transforms.get('h')),
+            'model': model_name,
+            'reprojection_error': None,
+            'rotation_vectors': None,
+            'translation_vectors': None,
+        }
+        args.output_calibration.parent.mkdir(parents=True, exist_ok=True)
+        with args.output_calibration.open('wb') as f:
+            pickle.dump(refined_calib, f)
+        print(f'Saved refined calibration to {args.output_calibration}')
+
+
+if __name__ == '__main__':
+    main()
