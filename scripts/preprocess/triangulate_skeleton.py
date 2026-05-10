@@ -348,6 +348,17 @@ def triangulate_skeleton(
     elif spa_labels_range is not None:
         b, e, s = spa_labels_range
         spa_labels = [format_spa_label(int(i)) for i in range(b, e, s)]
+    else:
+        def format_spa_label(i):
+            return f"{spa_label_prefix}{int(i):02d}"
+    
+    if spa_labels is not None:
+        if spa_labels_range is not None:
+            raise ValueError("spa_labels and spa_labels_range cannot be specified together")
+        spa_labels = [format_spa_label(int(i)) for i in spa_labels]
+    elif spa_labels_range is not None:
+        b, e, s = spa_labels_range
+        spa_labels = [format_spa_label(int(i)) for i in range(b, e, s)]
 
     if spa_labels is not None:
         if spa_labels_range is not None:
@@ -381,6 +392,9 @@ def triangulate_skeleton(
     print(f"Using spatial labels: {spa_labels}")
     print(f"Using spatial projection labels: {spa_labels_proj}")
 
+    print(f"Using spatial labels: {spa_labels}")
+    print(f"Using spatial projection labels: {spa_labels_proj}")
+
     if tem_labels is not None:
         if tem_labels_range is not None:
             raise ValueError("tem_labels and tem_label_range cannot be specified together")
@@ -389,11 +403,8 @@ def triangulate_skeleton(
         b, e, s = tem_labels_range
         tem_labels = [f"{int(i):06d}" for i in range(b, e, s)]
     else:
-        if kp2d_mode == "combined_json":
-            tem_labels = combined_tem_labels
-        else:
-            tem_labels = sorted(os.listdir(osp.join(kp2d_dir, spa_labels[0])))
-            tem_labels = [label.split(".")[0] for label in tem_labels]
+        tem_labels = sorted(os.listdir(osp.join(kp2d_dir, spa_labels[0])))
+        tem_labels = [label.split(".")[0] for label in tem_labels]
 
     # Auto-detect intrinsics scale factor if not specified
     if intri_scale is None:
@@ -480,22 +491,10 @@ def triangulate_skeleton(
         raise KeyError(f"Camera label not found: {camera_label}")
 
     def triangulate_one_skeleton(tem_label):
+        kp2d_paths = [osp.join(kp2d_dir, spa_label, f"{tem_label}.json") for spa_label in spa_labels]
         out_kp3d_path = osp.join(out_kp3d_dir, f"{tem_label}.json")
         out_pcd_path = osp.join(out_pcd_dir, f"{tem_label}.ply")
         out_kp2d_proj_paths = [osp.join(out_kp2d_proj_dir, spa_label, f"{tem_label}.json") for spa_label in spa_labels_proj]
-
-        Ks, Ts = zip(*[_get_cam_mats(spa_label, tem_label) for spa_label in spa_labels])
-        Ks_proj, Ts_proj = zip(*[_get_cam_mats(spa_label, tem_label) for spa_label in spa_labels_proj])
-        Ks = np.stack(Ks)
-        Ts = np.stack(Ts)
-        Ks_proj = np.stack(Ks_proj)
-        Ts_proj = np.stack(Ts_proj)
-
-        if intri_scale is not None:
-            Ks = Ks * intri_scale
-            Ks[:, -1, -1] = 1.0
-            Ks_proj = Ks_proj * intri_scale
-            Ks_proj[:, -1, -1] = 1.0
 
         if skip_exists and osp.exists(out_kp3d_path):
             try:
