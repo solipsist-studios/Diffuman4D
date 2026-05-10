@@ -68,48 +68,63 @@ def triangulate_skeleton(
     out_kp3d_dir: str,
     out_pcd_dir: str = None,
     out_kp2d_proj_dir: str = None,
-    spa_label_range: list[int] = None,
-    spa_label_proj_range: list[int] = None,
-    tem_label_range: list[int] = None,
+    spa_labels_range: list[int] = None,
+    spa_labels_proj_range: list[int] = None,
+    tem_labels_range: list[int] = None,
     spa_labels: list[int] = None,
     spa_labels_proj: list[int] = None,
     tem_labels: list[int] = None,
+    spa_label_prefix: str = "",
+    spa_label_format: str = None,
     kp2d_padding: list[int, int] = None,
     intri_scale: float = None,
     skip_exists: bool = False,
     num_workers: int = 1,
+    use_cuda: bool = False,
+    score_thr: float = 0.6,
     dtype=np.float64,
 ):
     # parse labels
+    # Determine label format function
+    if spa_label_format is not None:
+        def format_spa_label(i):
+            return spa_label_format.format(i)
+    else:
+        def format_spa_label(i):
+            return f"{spa_label_prefix}{int(i):02d}"
+    
     if spa_labels is not None:
-        if spa_label_range is not None:
-            raise ValueError("spa_labels and spa_label_range cannot be specified together")
-        spa_labels = [f"{int(i):02d}" for i in spa_labels]
-    elif spa_label_range is not None:
-        b, e, s = spa_label_range
-        spa_labels = [f"{int(i):02d}" for i in range(b, e, s)]
+        if spa_labels_range is not None:
+            raise ValueError("spa_labels and spa_labels_range cannot be specified together")
+        spa_labels = [format_spa_label(int(i)) for i in spa_labels]
+    elif spa_labels_range is not None:
+        b, e, s = spa_labels_range
+        spa_labels = [format_spa_label(int(i)) for i in range(b, e, s)]
     else:
         spa_labels = sorted(os.listdir(kp2d_dir))
 
     if spa_labels_proj is not None:
-        if spa_label_proj_range is not None:
-            raise ValueError("spa_labels_proj and spa_label_proj_range cannot be specified together")
-        spa_labels_proj = [f"{int(i):02d}" for i in spa_labels_proj]
-    elif spa_label_proj_range is not None:
-        b, e, s = spa_label_proj_range
-        spa_labels_proj = [f"{int(i):02d}" for i in range(b, e, s)]
+        if spa_labels_proj_range is not None:
+            raise ValueError("spa_labels_proj and spa_labels_proj_range cannot be specified together")
+        spa_labels_proj = [format_spa_label(int(i)) for i in spa_labels_proj]
+    elif spa_labels_proj_range is not None:
+        b, e, s = spa_labels_proj_range
+        spa_labels_proj = [format_spa_label(int(i)) for i in range(b, e, s)]
     else:
         spa_labels_proj = sorted(os.listdir(kp2d_dir))
 
+    print(f"Using spatial labels: {spa_labels}")
+    print(f"Using spatial projection labels: {spa_labels_proj}")
+
     if tem_labels is not None:
-        if tem_label_range is not None:
+        if tem_labels_range is not None:
             raise ValueError("tem_labels and tem_label_range cannot be specified together")
         tem_labels = [f"{int(i):06d}" for i in tem_labels]
-    elif tem_label_range is not None:
-        b, e, s = tem_label_range
+    elif tem_labels_range is not None:
+        b, e, s = tem_labels_range
         tem_labels = [f"{int(i):06d}" for i in range(b, e, s)]
     else:
-        tem_labels = sorted(os.listdir(f"{kp2d_dir}/{spa_labels[0]}"))
+        tem_labels = sorted(os.listdir(osp.join(kp2d_dir, spa_labels[0])))
         tem_labels = [label.split(".")[0] for label in tem_labels]
 
     # load cameras
@@ -127,10 +142,10 @@ def triangulate_skeleton(
         Ks_proj[:, -1, -1] = 1.0
 
     def triangulate_one_skeleton(tem_label):
-        kp2d_paths = [f"{kp2d_dir}/{spa_label}/{tem_label}.json" for spa_label in spa_labels]
-        out_kp3d_path = f"{out_kp3d_dir}/{tem_label}.json"
-        out_pcd_path = f"{out_pcd_dir}/{tem_label}.ply"
-        out_kp2d_proj_paths = [f"{out_kp2d_proj_dir}/{spa_label}/{tem_label}.json" for spa_label in spa_labels_proj]
+        kp2d_paths = [osp.join(kp2d_dir, spa_label, f"{tem_label}.json") for spa_label in spa_labels]
+        out_kp3d_path = osp.join(out_kp3d_dir, f"{tem_label}.json")
+        out_pcd_path = osp.join(out_pcd_dir, f"{tem_label}.ply")
+        out_kp2d_proj_paths = [osp.join(out_kp2d_proj_dir, spa_label, f"{tem_label}.json") for spa_label in spa_labels_proj]
 
         if skip_exists and osp.exists(out_kp3d_path):
             try:
@@ -146,7 +161,11 @@ def triangulate_skeleton(
             kp2d += np.array(kp2d_padding, dtype=dtype)[None]
 
         # triangulate keypoints
-        kp3d, kp3d_reproj, _ = triangulate_points(Ks, Ts, kp2d, kp2d_score)
+        kp3d, kp3d_reproj, _ = triangulate_points(
+            Ks, Ts, kp2d, kp2d_score, 
+            score_thr=score_thr, 
+            use_cuda=use_cuda
+        )
 
         # save 3d keypoints
         write_kp3d(out_kp3d_path, kp3d, kp3d_reproj)

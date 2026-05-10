@@ -11,7 +11,43 @@ from scripts.preprocess.remove_background import remove_background
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
-def diffuman4d_to_nerfstudio(data_dir: str, result_dir: str, input_cameras: list[str] = None):
+def diffuman4d_to_nerfstudio(
+    data_dir: str,
+    result_dir: str,
+    input_cameras: list[str] = None,
+    tem_label: str | None = None,
+    image_ext: str = ".jpg",
+):
+    """
+    Convert Diffuman4D outputs to NeRF Studio format.
+    
+    Args:
+        data_dir: Directory containing preprocessed data
+        result_dir: Output directory for NeRF Studio format
+        input_cameras: List of input camera labels
+        tem_label: Frame specifier to use for the point cloud
+        image_ext: Image extension for input images (default: .jpg)
+    """  
+    if not image_ext.startswith("."):
+        image_ext = f".{image_ext}"
+    # Format the temporal label for the point cloud file
+    pcd_path = f"{data_dir}/poses_pcd/{tem_label}.ply"
+    
+    if not osp.exists(pcd_path):
+        log.warning(f"Point cloud not found at {pcd_path}, looking for alternatives...")
+        # Fallback: try to find first available PCD file
+        pcd_dir = f"{data_dir}/poses_pcd"
+        if osp.exists(pcd_dir):
+            pcd_files = sorted([f for f in os.listdir(pcd_dir) if f.endswith(".ply")])
+            if pcd_files:
+                pcd_path = osp.join(pcd_dir, pcd_files[0])
+                log.info(f"Using first available point cloud: {pcd_path}")
+            else:
+                log.error(f"No .ply files found in {pcd_dir}")
+                raise FileNotFoundError(f"No point cloud files found in {pcd_dir}")
+        else:
+            raise FileNotFoundError(f"poses_pcd directory not found at {pcd_dir}")
+    
     # copy nerfstudio cameras
     cameras_path = f"{data_dir}/transforms.json"
     cameras = json.load(open(cameras_path))
@@ -30,13 +66,14 @@ def diffuman4d_to_nerfstudio(data_dir: str, result_dir: str, input_cameras: list
     os.makedirs(result_dir, exist_ok=True)
     with open(f"{result_dir}/transforms.json", "w") as f:
         json.dump(cameras, f, indent=4)
-    with open(f"{result_dir}/transforms_input.json", "w") as f:
-        json.dump(cameras_input, f, indent=4)
-    log.info(f"Saved nerfstudio cameras to {result_dir}/transforms.json and {result_dir}/transforms_input.json")
+    if input_cameras is not None:
+        with open(f"{result_dir}/transforms_input.json", "w") as f:
+            json.dump(cameras_input, f, indent=4)
+    log.info(f"Saved nerfstudio cameras to {result_dir}/transforms.json")
 
     # copy point cloud
-    shutil.copy(f"{data_dir}/sparse_pcd.ply", f"{result_dir}/sparse_pcd.ply")
-    log.info(f"Saved point cloud to {result_dir}/sparse_pcd.ply")
+    shutil.copy(pcd_path, f"{result_dir}/sparse_pcd.ply")
+    log.info(f"Saved point cloud from {pcd_path} to {result_dir}/sparse_pcd.ply")
 
     # predict foreground masks
     remove_background(
@@ -44,7 +81,7 @@ def diffuman4d_to_nerfstudio(data_dir: str, result_dir: str, input_cameras: list
         out_fmasks_dir=f"{result_dir}/fmasks",
         out_images_alpha_dir=f"{result_dir}/images_alpha",
         model_name="ZhengPeng7/BiRefNet",
-        image_ext=".jpg",
+        image_ext=image_ext,
         mask_ext=".png",
         rotate_clockwise=0,
         batch_size=4,  # decrease it if OOM

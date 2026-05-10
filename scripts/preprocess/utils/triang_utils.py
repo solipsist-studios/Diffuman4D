@@ -1,36 +1,72 @@
 import numpy as np
 from scipy.optimize import least_squares
 
+# optional GPU support via CuPy
+try:
+    import cupy as cp
+    _HAS_CUPY = True
+except Exception:
+    cp = None
+    _HAS_CUPY = False
+
 INVALID = -1e6
 
 
-def project_one_point(kp3d, Ks, Ts):
-    """kp3d: (3,) in world; Ks:(m,3,3); Ts:(m,4,4) world->cam -> (m,2)"""
-    if (kp3d == INVALID).any():
+def project_one_point(kp3d, Ks, Ts, use_cuda: bool = False):
+    """kp3d: (3,) in world; Ks:(m,3,3); Ts:(m,4,4) world->cam -> (m,2)
+    If `use_cuda` and CuPy is available, computations are performed on GPU.
+    """
+    xp = cp if (use_cuda and _HAS_CUPY) else np
+
+    # quick invalid check on CPU values
+    if (np.array(kp3d) == INVALID).any():
         return np.ones((Ks.shape[0], 2)) * INVALID, np.ones((Ks.shape[0],)) * INVALID
 
-    kp3d_h = np.append(kp3d, 1.0)  # (4,)
-    P = Ks @ Ts[:, :3]  # (m,3,4)
+    kp3d_h = xp.concatenate([xp.asarray(kp3d).ravel(), xp.asarray([1.0])])  # (4,)
+    Ks_x = xp.asarray(Ks)
+    Ts_x = xp.asarray(Ts)
+    P = Ks_x @ Ts_x[:, :3]  # (m,3,4)
     kp2d_h = P @ kp3d_h  # (m,3)
     depth = kp2d_h[:, 2]
-    kp2d_h = kp2d_h[:, :2] / (depth[:, None] + 1e-9)
-    return kp2d_h, depth
+    kp2d = kp2d_h[:, :2] / (depth[:, None] + 1e-9)
+
+    # return to CPU arrays for downstream compatibility
+    return (cp.asnumpy(kp2d) if use_cuda and _HAS_CUPY else kp2d), (cp.asnumpy(depth) if use_cuda and _HAS_CUPY else depth)
 
 
-def project_points(kp3d, Ks, Ts, kp3d_score=None):
-    projs = [project_one_point(p, Ks, Ts) for p in kp3d]
-    kp2d = np.array([p[0] for p in projs], dtype=float).transpose(1, 0, 2)
-    kp2d_depth = np.array([p[1] for p in projs], dtype=float).transpose(1, 0)
+def project_points(kp3d, Ks, Ts, kp3d_score=None, use_cuda: bool = False):
+    """Project multiple 3D keypoints to 2D for all cameras.
+    If `use_cuda` and CuPy is available, the batched projection uses the GPU.
+    Returns (kp2d: (n_cams, k, 2), kp2d_depth: (n_cams, k), kp2d_score)
+    """
+    xp = cp if (use_cuda and _HAS_CUPY) else np
+
+    if use_cuda and not _HAS_CUPY:
+        raise RuntimeError("CuPy requested but not available.")
+
+    # perform batched projection on xp then return numpy arrays
+    Ks_x = xp.asarray(Ks)
+    Ts_x = xp.asarray(Ts)
+    kp3d_x = xp.asarray(kp3d)
+
+    projs_kp2d = []
+    projs_depth = []
+    for p in kp3d_x:
+        kp2d, depth = project_one_point(p, Ks, Ts, use_cuda=use_cuda)
+        projs_kp2d.append(kp2d)
+        projs_depth.append(depth)
+
+    kp2d = np.array([p for p in projs_kp2d], dtype=float).transpose(1, 0, 2)
+    kp2d_depth = np.array([p for p in projs_depth], dtype=float).transpose(1, 0)
 
     if kp3d_score is not None:
-        # repeat kp3d_score for each 2d keypoint
         kp2d_score = kp3d_score[None, :].repeat(kp2d.shape[0], axis=0)
     else:
         kp2d_score = None
 
     # update keypoint score based on face normal and camera normal
-    def get_face_normal(kp3d):
-        nose, left_eye, right_eye = kp3d[:3]
+    def get_face_normal(kp3d_np):
+        nose, left_eye, right_eye = kp3d_np[:3]
         eye_mid = (left_eye + right_eye) / 2
         v1 = right_eye - left_eye
         v2 = nose - eye_mid
@@ -38,7 +74,6 @@ def project_points(kp3d, Ks, Ts, kp3d_score=None):
         normal /= np.linalg.norm(normal)
         return normal
 
-    # update keypoint score based on face normal
     if kp3d_score is not None:
         face_normal = get_face_normal(kp3d)
         cam_normal = Ts[:, 2, :3]
@@ -50,7 +85,7 @@ def project_points(kp3d, Ks, Ts, kp3d_score=None):
     return kp2d, kp2d_depth, kp2d_score
 
 
-def triangulate_one_point(Ks, Ts, kp2d, kp2d_score=None, min_views=3, max_views=24, score_thr=0.6):
+def triangulate_one_point(Ks, Ts, kp2d, kp2d_score=None, min_views=3, max_views=24, score_thr=0.6, use_cuda: bool = False):
     """
     Ks, Ts      : (m, 3,3) & (m,4,4)
     kp2d        : (m, 2) valid 2-D observations
@@ -80,19 +115,55 @@ def triangulate_one_point(Ks, Ts, kp2d, kp2d_score=None, min_views=3, max_views=
 
     # 1. initial linear solution
     A, w = [], []
-    for (u, v), K, T, s in zip(kp2d, Ks, Ts, kp2d_score):
-        if s <= 0 or u < 0 or v < 0:
-            continue
-        P = K @ T[:3]
-        A.append(u * P[2] - P[0])
-        A.append(v * P[2] - P[1])
-        w.extend([s, s])
-    A = np.stack(A)  # (2m,4)
-    W = np.diag(np.sqrt(w))
-    Aw = W @ A
-    _, _, Vt = np.linalg.svd(Aw)
-    kp3d_lin_h = Vt[-1]
-    kp3d_lin = kp3d_lin_h[:3] / (kp3d_lin_h[3] + 1e-9)
+    # Optionally compute the initial linear solution on GPU
+    if use_cuda and _HAS_CUPY:
+        xp = cp
+        Ks_x = xp.asarray(Ks)
+        Ts_x = xp.asarray(Ts)
+        kp2d_x = xp.asarray(kp2d)
+        kp2d_score_x = xp.asarray(kp2d_score)
+
+        A_list = []
+        w_list = []
+        for (u, v), K, T, s in zip(kp2d_x, Ks_x, Ts_x, kp2d_score_x):
+            if float(s) <= 0 or float(u) < 0 or float(v) < 0:
+                continue
+            P = K @ T[:3]
+            A_list.append(u * P[2] - P[0])
+            A_list.append(v * P[2] - P[1])
+            w_list.extend([s, s])
+
+        if len(A_list) == 0:
+            return None, None, 0
+
+        A_x = xp.stack(A_list)
+        W_x = xp.diag(xp.sqrt(xp.asarray(w_list)))
+        Aw_x = W_x @ A_x
+        # SVD on GPU
+        _, _, Vt_x = xp.linalg.svd(Aw_x)
+        kp3d_lin_h = Vt_x[-1]
+        kp3d_lin = kp3d_lin_h[:3] / (kp3d_lin_h[3] + 1e-9)
+        kp3d_lin = cp.asnumpy(kp3d_lin) if _HAS_CUPY else kp3d_lin
+    else:
+        for (u, v), K, T, s in zip(kp2d, Ks, Ts, kp2d_score):
+            if s <= 0 or u < 0 or v < 0:
+                continue
+            P = K @ T[:3]
+            A.append(u * P[2] - P[0])
+            A.append(v * P[2] - P[1])
+            w.extend([s, s])
+        # If no valid observations (all views filtered due to score or invalid coords),
+        # A will be empty and np.stack will raise. Return early in that case.
+        if len(A) == 0:
+            # number of valid views used is zero
+            return None, None, 0
+
+        A = np.stack(A)  # (2m,4)
+        W = np.diag(np.sqrt(w))
+        Aw = W @ A
+        _, _, Vt = np.linalg.svd(Aw)
+        kp3d_lin_h = Vt[-1]
+        kp3d_lin = kp3d_lin_h[:3] / (kp3d_lin_h[3] + 1e-9)
 
     # 2. non-linear reprojection
     # make w per-coord √weight, multiply residual directly
@@ -126,7 +197,7 @@ def triangulate_one_point(Ks, Ts, kp2d, kp2d_score=None, min_views=3, max_views=
     return kp3d, reproj, n_views
 
 
-def triangulate_points(Ks, Ts, kp2d, kp2d_score=None, min_views=3, score_thr=0.6):
+def triangulate_points(Ks, Ts, kp2d, kp2d_score=None, min_views=3, score_thr=0.6, use_cuda: bool = False):
     """
     Ks            : (n, 3, 3)
     Ts            : (n, 4, 4)
@@ -165,6 +236,7 @@ def triangulate_points(Ks, Ts, kp2d, kp2d_score=None, min_views=3, score_thr=0.6
             kp2d_score=kp2d_score[:, i],
             min_views=min_views,
             score_thr=score_thr,
+            use_cuda=use_cuda,
         )
         if _kp3d is not None:
             kp3d[i] = _kp3d
