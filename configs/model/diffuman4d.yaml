@@ -1,5 +1,6 @@
 _target_: src.samplers.utils.sampling_utils.load_pipelines
 repo_id: "krahets/Diffuman4D"
 model_dir: "./models/models--krahets--Diffuman4D" # local model directory
-torch_dtype: "bf16" # use "fp16" if "bf16" is not supported by your GPU
+torch_dtype: "fp16" # use "fp16" if "bf16" is not supported by your GPU
 gpu_ids: null # use all GPUs if null
+vae_batch_size: 2 # VAE decode batch size; reduce if OOM
