@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os, os.path as osp
 import sys
 import json
