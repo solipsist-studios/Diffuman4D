@@ -3,17 +3,79 @@ import os
 import cv2
 import fire
 import json
-import math
 import numpy as np
-from glob import glob
+import importlib
 from PIL import Image
 from easyvolcap.utils.parallel_utils import parallel_execution
 
-from sapiens.lite.demo.classes_and_palettes import (
-    COCO_WHOLEBODY_KPTS_COLORS,
-    COCO_WHOLEBODY_SKELETON_INFO,
-    BLUE,
-)
+BLUE = [51, 153, 255]
+
+
+def _resolve_keypoints308_metainfo_file() -> str | None:
+    try:
+        sapiens_mod = importlib.import_module("sapiens")
+    except Exception:
+        return None
+
+    sapiens_root = os.path.dirname(sapiens_mod.__file__)
+    candidates = [
+        os.path.join(sapiens_root, "pose", "configs", "_base_", "keypoints308.py"),
+        os.path.join(sapiens_root, "configs", "_base_", "keypoints308.py"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _build_default_colors(n_kpts: int) -> list[list[int]]:
+    # Deterministic color palette fallback when metainfo is unavailable.
+    colors = []
+    for i in range(n_kpts):
+        hue = int((179.0 * i) / max(1, n_kpts))
+        bgr = cv2.cvtColor(np.uint8([[[hue, 220, 255]]]), cv2.COLOR_HSV2BGR)[0, 0]
+        colors.append([int(bgr[2]), int(bgr[1]), int(bgr[0])])
+    return colors
+
+
+def _get_layout_info(n_kpts: int):
+    """Return (colors_info, skeleton_info) for known keypoint layouts."""
+    if n_kpts == 133:
+        try:
+            from sapiens.lite.demo.classes_and_palettes import (
+                COCO_WHOLEBODY_KPTS_COLORS,
+                COCO_WHOLEBODY_SKELETON_INFO,
+            )
+
+            colors = [list(map(int, c)) for c in COCO_WHOLEBODY_KPTS_COLORS]
+            skeleton = {int(k): v for k, v in dict(COCO_WHOLEBODY_SKELETON_INFO).items()}
+            return colors, skeleton
+        except Exception:
+            pass
+
+    if n_kpts == 308:
+        try:
+            from sapiens.pose.datasets import parse_pose_metainfo
+
+            metainfo_file = _resolve_keypoints308_metainfo_file()
+            if metainfo_file is not None:
+                metainfo = parse_pose_metainfo(dict(from_file=metainfo_file))
+                colors = np.asarray(metainfo["keypoint_colors"], dtype=np.int32)
+                links = metainfo["skeleton_links"]
+                link_colors = np.asarray(metainfo["skeleton_link_colors"], dtype=np.int32)
+                skeleton = {
+                    int(i): {
+                        "link": (int(link[0]), int(link[1])),
+                        "id": int(i),
+                        "color": [int(v) for v in link_colors[i].tolist()],
+                    }
+                    for i, link in enumerate(links)
+                }
+                return colors.tolist(), skeleton
+        except Exception:
+            pass
+
+    return _build_default_colors(n_kpts), {}
 
 
 def score_to_color(rgb, score, low=0.5, high=0.9):
@@ -32,8 +94,8 @@ def draw_one_skeleton(
     out_kpmap_shape=(1024, 1024),
     low_thr=0.5,
     high_thr=0.9,
-    colors_info=COCO_WHOLEBODY_KPTS_COLORS,
-    skeleton_info=COCO_WHOLEBODY_SKELETON_INFO,
+    colors_info=None,
+    skeleton_info=None,
     radius=2,
     thickness=2,
     image_quality=85,
@@ -51,6 +113,14 @@ def draw_one_skeleton(
     kpts_dict = json.load(open(kp2d_path))["instance_info"][0]
 
     kpts = np.array(kpts_dict["keypoints"], dtype=np.float32)
+    n_kpts = len(kpts)
+
+    if colors_info is None or skeleton_info is None:
+        auto_colors, auto_skeleton = _get_layout_info(n_kpts)
+        if colors_info is None:
+            colors_info = auto_colors
+        if skeleton_info is None:
+            skeleton_info = auto_skeleton
 
     if kp2d_score_path is not None:
         # override the scores from the kp2d_score_path
@@ -84,35 +154,33 @@ def draw_one_skeleton(
     # please ensure the canvas shape matches the input image shape of sapiens poses
     canvas = np.zeros(np.concatenate([out_kpmap_shape, [3]]), dtype=np.uint8)
 
-    if colors_info is None or len(colors_info) != len(kpts):
-        raise ValueError(
-            f"the length of kpt_color ({len(colors_info)}) \
-            does not matches that of keypoints ({len(kpts)})"
-        )
+    if colors_info is None:
+        colors_info = _build_default_colors(n_kpts)
+    if len(colors_info) < n_kpts:
+        colors_info = list(colors_info) + _build_default_colors(n_kpts - len(colors_info))
+    elif len(colors_info) > n_kpts:
+        colors_info = list(colors_info[:n_kpts])
 
     # add x links for the body
-    skeleton_info.update(
-        {
-            65: dict(link=(5, 12), id=65, color=BLUE),  # left shoulder to right hip
-            66: dict(link=(6, 11), id=66, color=BLUE),  # right shoulder to left hip
-        }
-    )
+    skeleton_info = dict(skeleton_info or {})
+    if n_kpts > 12:
+        skeleton_info.update(
+            {
+                10065: dict(link=(5, 12), id=10065, color=BLUE),  # left shoulder to right hip
+                10066: dict(link=(6, 11), id=10066, color=BLUE),  # right shoulder to left hip
+            }
+        )
 
     # reweight the radius and thickness of the skeleton
-    radius = int(round(radius * scale_ratio))
-    thickness = int(round(thickness * scale_ratio))
-    radius = np.ones(len(skeleton_info)) * radius
-    thickness = np.ones(len(skeleton_info)) * thickness
-    # highlight the major body parts
-    radius[:25] *= 2
-    thickness[:25] *= 2
-    radius = radius.astype(np.int32)
-    thickness = thickness.astype(np.int32)
+    base_radius = int(round(radius * scale_ratio))
+    base_thickness = int(round(thickness * scale_ratio))
 
     # draw skeleton
     lines = []
-    for skid, link_info in skeleton_info.items():
+    for lid, (_, link_info) in enumerate(skeleton_info.items()):
         i1, i2 = link_info["link"]
+        if i1 >= n_kpts or i2 >= n_kpts:
+            continue
         p1_score = scores[i1]
         p2_score = scores[i2]
         line_score = np.min((p1_score, p2_score))
@@ -141,8 +209,8 @@ def draw_one_skeleton(
                 "p1_color": p1_color[::-1],
                 "p2_color": p2_color[::-1],
                 "line_color": line_color[::-1],
-                "radius": radius[skid],
-                "thickness": thickness[skid],
+                "radius": int(base_radius * (2 if lid < 25 else 1)),
+                "thickness": int(base_thickness * (2 if lid < 25 else 1)),
             }
         )
 
@@ -166,11 +234,11 @@ def draw_one_skeleton(
         for kid, kpt in enumerate(kpts):
             if not (23 < kid < 91):
                 continue
-            if scores[kid] < low_thr or colors_info[kid] is None:
+            if scores[kid] < low_thr:
                 continue
             color = score_to_color(colors_info[kid], scores[kid], low=low_thr, high=high_thr)
             x, y = int(round(kpt[0])), int(round(kpt[1]))
-            cv2.circle(canvas, (x, y), radius, color[::-1], -1)
+            cv2.circle(canvas, (x, y), base_radius, color[::-1], -1)
 
     os.makedirs(os.path.dirname(out_kpmap_path), exist_ok=True)
     canvas = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)

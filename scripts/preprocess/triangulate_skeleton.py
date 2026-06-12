@@ -24,9 +24,11 @@ def read_kp2d(path, dtype=np.float64):
     if "keypoint_scores" in instance:
         kp_score = np.array(instance["keypoint_scores"], dtype=dtype)
 
-    # re-scale fingers score with hand root score
-    kp_score[92:112] *= kp_score[91] ** 2
-    kp_score[113:133] *= kp_score[112] ** 2
+    # Re-scale finger scores with hand root confidence for legacy 133-keypoint layout.
+    # For 308-keypoint layouts, these indices no longer map to the same semantics.
+    if kp_score is not None and kp_score.shape[0] == 133:
+        kp_score[92:112] *= kp_score[91] ** 2
+        kp_score[113:133] *= kp_score[112] ** 2
 
     return kp, kp_depth, kp_score
 
