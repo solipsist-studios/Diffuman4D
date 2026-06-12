@@ -80,10 +80,12 @@ def infer_camera_model(model, dist):
     return 'OPENCV_FISHEYE' if flat.size == 4 else 'OPENCV'
 
 
-def main() -> None:
-    args = parse_args()
-    data = load_calibration(args.calibration_pkl)
-
+def build_transforms(
+    data: dict,
+    width: int | None = None,
+    height: int | None = None,
+    camera_model: str | None = None,
+) -> dict:
     mtx = np.asarray(data["camera_matrix"], dtype=np.float64)
     dist = np.asarray(data["distortion_coefficients"], dtype=np.float64).reshape(-1)
 
@@ -95,8 +97,6 @@ def main() -> None:
     cx = float(mtx[0, 2])
     cy = float(mtx[1, 2])
 
-    width = args.width
-    height = args.height
     image_size = data.get("image_size")
     if (width is None or height is None) and image_size is not None and len(image_size) == 2:
         if width is None:
@@ -106,43 +106,56 @@ def main() -> None:
 
     if width is None or height is None:
         raise ValueError(
-            "Could not determine width/height. Provide --width and --height, "
-            "or include image_size=(w, h) in calibration pkl."
+            "Could not determine width/height. Provide overrides, "
+            "or include image_size=(w, h) in calibration data."
         )
 
-    camera_model = args.camera_model or infer_camera_model(data.get("model"), dist)
+    resolved_model = camera_model or infer_camera_model(data.get("model"), dist)
 
     transforms = {
-        "camera_model": camera_model,
+        "camera_model": resolved_model,
         "w": int(width),
         "h": int(height),
         "fl_x": fx,
         "fl_y": fy,
         "cx": cx,
-        "cy": cy
+        "cy": cy,
+        "frames": [],
     }
 
-    # Map distortion coefficients to the keys expected by predict_poses.py.
-    if camera_model == "OPENCV_FISHEYE":
+    if resolved_model == "OPENCV_FISHEYE":
         transforms["k1"] = float(dist[0]) if dist.size > 0 else 0.0
         transforms["k2"] = float(dist[1]) if dist.size > 1 else 0.0
         transforms["k3"] = float(dist[2]) if dist.size > 2 else 0.0
         transforms["k4"] = float(dist[3]) if dist.size > 3 else 0.0
-
-    elif camera_model == "OPENCV":
+    elif resolved_model == "OPENCV":
         transforms["k1"] = float(dist[0]) if dist.size > 0 else 0.0
         transforms["k2"] = float(dist[1]) if dist.size > 1 else 0.0
         transforms["p1"] = float(dist[2]) if dist.size > 2 else 0.0
         transforms["p2"] = float(dist[3]) if dist.size > 3 else 0.0
 
-    transforms["frames"] = []
+    return transforms
+
+
+def main() -> None:
+    args = parse_args()
+    data = load_calibration(args.calibration_pkl)
+    transforms = build_transforms(
+        data=data,
+        width=args.width,
+        height=args.height,
+        camera_model=args.camera_model,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as f:
         json.dump(transforms, f, indent=args.indent)
 
     print(f"Wrote transforms JSON to: {args.output}")
-    print(f"camera_model={camera_model}, w={width}, h={height}")
-    print(f"fl_x={fx:.6f}, fl_y={fy:.6f}, cx={cx:.6f}, cy={cy:.6f}")
+    print(f"camera_model={transforms['camera_model']}, w={transforms['w']}, h={transforms['h']}")
+    print(
+        f"fl_x={transforms['fl_x']:.6f}, fl_y={transforms['fl_y']:.6f}, "
+        f"cx={transforms['cx']:.6f}, cy={transforms['cy']:.6f}"
+    )
 
 
 if __name__ == "__main__":

@@ -97,6 +97,86 @@ def load_camera_from_transforms(transforms: dict) -> pycolmap.Camera:
     )
 
 
+def _can_load_per_frame_intrinsics(transforms: dict) -> bool:
+    frames = transforms.get('frames')
+    if not isinstance(frames, list) or not frames:
+        return False
+
+    try:
+        for frame in frames:
+            load_camera_from_transforms(frame)
+    except Exception:
+        return False
+
+    return True
+
+
+def _intrinsics_from_colmap_camera(camera: pycolmap.Camera) -> dict:
+    model_name = camera.model.name
+    params = [float(value) for value in camera.params]
+
+    intrinsics = {
+        'camera_model': model_name,
+        'w': int(camera.width),
+        'h': int(camera.height),
+    }
+
+    if model_name == 'SIMPLE_PINHOLE':
+        fl_x, cx, cy = params
+        intrinsics['fl_x'] = fl_x
+        intrinsics['fl_y'] = fl_x
+        intrinsics['cx'] = cx
+        intrinsics['cy'] = cy
+    elif model_name == 'PINHOLE':
+        fl_x, fl_y, cx, cy = params
+        intrinsics['fl_x'] = fl_x
+        intrinsics['fl_y'] = fl_y
+        intrinsics['cx'] = cx
+        intrinsics['cy'] = cy
+    elif model_name == 'SIMPLE_RADIAL':
+        fl_x, cx, cy, k1 = params
+        intrinsics['fl_x'] = fl_x
+        intrinsics['fl_y'] = fl_x
+        intrinsics['cx'] = cx
+        intrinsics['cy'] = cy
+        intrinsics['k1'] = k1
+    elif model_name == 'RADIAL':
+        fl_x, cx, cy, k1, k2 = params
+        intrinsics['fl_x'] = fl_x
+        intrinsics['fl_y'] = fl_x
+        intrinsics['cx'] = cx
+        intrinsics['cy'] = cy
+        intrinsics['k1'] = k1
+        intrinsics['k2'] = k2
+    elif model_name == 'OPENCV':
+        fl_x, fl_y, cx, cy, k1, k2, p1, p2 = params
+        intrinsics['fl_x'] = fl_x
+        intrinsics['fl_y'] = fl_y
+        intrinsics['cx'] = cx
+        intrinsics['cy'] = cy
+        intrinsics['k1'] = k1
+        intrinsics['k2'] = k2
+        intrinsics['p1'] = p1
+        intrinsics['p2'] = p2
+    elif model_name == 'OPENCV_FISHEYE':
+        fl_x, fl_y, cx, cy, k1, k2, k3, k4 = params
+        intrinsics['fl_x'] = fl_x
+        intrinsics['fl_y'] = fl_y
+        intrinsics['cx'] = cx
+        intrinsics['cy'] = cy
+        intrinsics['k1'] = k1
+        intrinsics['k2'] = k2
+        intrinsics['k3'] = k3
+        intrinsics['k4'] = k4
+    else:
+        raise ValueError(
+            f"Unsupported camera_model '{model_name}'. "
+            'Supported models: SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, OPENCV_FISHEYE'
+        )
+
+    return intrinsics
+
+
 def _infer_camera_model(model: str | None, dist: np.ndarray) -> str:
     supported = {'OPENCV', 'OPENCV_FISHEYE', 'PINHOLE'}
     if model in supported:
@@ -349,21 +429,49 @@ def main() -> None:
             camera_model=args.camera_model,
         )
 
-    if transforms.get('w') is None or transforms.get('h') is None:
-        print('Image dimensions not found in input — inferring from images_dir...')
-        w, h = _infer_image_size(images_dir)
-        transforms['w'] = w
-        transforms['h'] = h
-        print(f'Inferred image size: {w}x{h}')
+    use_per_frame_intrinsics = _can_load_per_frame_intrinsics(transforms)
 
-    camera_model = load_camera_from_transforms(transforms)
+    if use_per_frame_intrinsics:
+        frame_models = {str(frame.get('camera_model', '')).upper() for frame in transforms['frames']}
+        if len(frame_models) != 1:
+            raise ValueError(
+                f'Per-frame intrinsics require a single camera_model across all frames, got: {sorted(frame_models)}'
+            )
+
+        per_frame_model = next(iter(frame_models))
+        camera_mode = pycolmap.CameraMode.PER_IMAGE
+        image_options_dict = {
+            'camera_model': per_frame_model,
+        }
+        print(
+            'Using per-frame intrinsics from input transforms frames '
+            f'(camera_mode={camera_mode.name}, camera_model={per_frame_model}).'
+        )
+
+        if transforms.get('w') is None or transforms.get('h') is None:
+            first_frame = transforms['frames'][0]
+            transforms['w'] = int(first_frame['w'])
+            transforms['h'] = int(first_frame['h'])
+    else:
+        if transforms.get('w') is None or transforms.get('h') is None:
+            print('Image dimensions not found in input — inferring from images_dir...')
+            w, h = _infer_image_size(images_dir)
+            transforms['w'] = w
+            transforms['h'] = h
+            print(f'Inferred image size: {w}x{h}')
+
+        global_camera = load_camera_from_transforms(transforms)
+        camera_mode = pycolmap.CameraMode.SINGLE
+        image_options_dict = {
+            'camera_model': global_camera.model.name,
+            'camera_params': ','.join(str(float(value)) for value in global_camera.params)
+        }
+        print(
+            'Using global intrinsics from top-level transforms '
+            f'(camera_mode={camera_mode.name}, camera_model={global_camera.model.name}).'
+        )
 
     print("Running COLMAP reconstruction...")
-
-    image_options_dict = {
-        "camera_model": camera_model.model.name,
-        "camera_params": ",".join(str(float(value)) for value in camera_model.params)
-    }
 
     mapper_options_dict = {
         "ba_refine_focal_length": not args.lock_focus,
@@ -383,78 +491,30 @@ def main() -> None:
         sfm_pairs,
         feature_path,
         match_path,
-        camera_mode=pycolmap.CameraMode.SINGLE, 
+        camera_mode=camera_mode,
         image_options=image_options_dict,
         mapper_options=mapper_options_dict
     )
 
     print(f"Reconstruction complete! Reconstructed {model.num_reg_images()} images.")
 
-    # Extract the newly refined camera parameters from COLMAP
-    refined_camera = list(model.cameras.values())[0] # Grab the single camera model
+    refined_intrinsics_by_camera_id = {
+        camera_id: _intrinsics_from_colmap_camera(camera)
+        for camera_id, camera in model.cameras.items()
+    }
 
-    if camera_model.model.name == 'SIMPLE_PINHOLE':
-        fl_x, cx, cy = refined_camera.params
-    
-        transforms["fl_x"] = fl_x
-        transforms["cx"] = cx
-        transforms["cy"] = cy
+    if not refined_intrinsics_by_camera_id:
+        raise RuntimeError('No reconstructed cameras were found after COLMAP reconstruction.')
 
-    elif camera_model.model.name == 'PINHOLE':
-        fl_x, fl_y, cx, cy = refined_camera.params
-
-        transforms["fl_x"] = fl_x
-        transforms["fl_y"] = fl_y
-        transforms["cx"] = cx
-        transforms["cy"] = cy
-
-    elif camera_model.model.name == 'SIMPLE_RADIAL':
-        fl_x, cx, cy, k1 = refined_camera.params
-
-        transforms["fl_x"] = fl_x
-        transforms["cx"] = cx
-        transforms["cy"] = cy
-        transforms["k1"] = k1
-
-    elif camera_model.model.name == 'RADIAL':
-        fl_x, cx, cy, k1, k2 = refined_camera.params
-
-        transforms["fl_x"] = fl_x
-        transforms["cx"] = cx
-        transforms["cy"] = cy
-        transforms["k1"] = k1
-        transforms["k2"] = k2
-
-    elif camera_model.model.name == 'OPENCV':
-        fl_x, fl_y, cx, cy, k1, k2, p1, p2 = refined_camera.params
-
-        transforms["fl_x"] = fl_x
-        transforms["fl_y"] = fl_y
-        transforms["cx"] = cx
-        transforms["cy"] = cy
-        transforms["k1"] = k1
-        transforms["k2"] = k2
-        transforms["p1"] = p1
-        transforms["p2"] = p2
-
-    elif camera_model.model.name == 'OPENCV_FISHEYE':
-        fl_x, fl_y, cx, cy, k1, k2, k3, k4 = refined_camera.params
-
-        transforms["fl_x"] = fl_x
-        transforms["fl_y"] = fl_y
-        transforms["cx"] = cx
-        transforms["cy"] = cy
-        transforms["k1"] = k1
-        transforms["k2"] = k2
-        transforms["k3"] = k3
-        transforms["k4"] = k4
-
-    else:
-        raise ValueError(
-            f"Unsupported camera_model '{camera_model.model.name}'. "
-            "Supported models: SIMPLE_PINHOLE, PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, OPENCV_FISHEYE"
+    if len(refined_intrinsics_by_camera_id) > 1:
+        print(
+            'COLMAP produced multiple camera models; writing refined intrinsics per frame '
+            'and using the first camera as top-level intrinsics.'
         )
-    
+
+    first_refined_intrinsics = next(iter(refined_intrinsics_by_camera_id.values()))
+    for key, value in first_refined_intrinsics.items():
+        transforms[key] = value
 
     # Extract poses from the PyCOLMAP Reconstruction object
     # The 'model' variable is what was returned by reconstruction.main()
@@ -481,12 +541,17 @@ def main() -> None:
         c2w_matrix[:3, :3] = R_c2w
         c2w_matrix[:3, 3] = t_c2w
 
+        refined_intrinsics = refined_intrinsics_by_camera_id[image.camera_id]
+
         # Append to our frames list
-        transforms["frames"].append({
+        frame_entry = {
             "file_path": f"images\\{output_file_name}",
             "camera_label": camera_label,
             "transform_matrix": c2w_matrix.tolist()
-        })
+        }
+        for key, value in refined_intrinsics.items():
+            frame_entry[key] = value
+        transforms["frames"].append(frame_entry)
 
     # Convert OpenCV -> OpenGL
     translations = []
