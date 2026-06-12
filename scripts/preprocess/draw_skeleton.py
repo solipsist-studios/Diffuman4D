@@ -175,7 +175,10 @@ def draw_one_skeleton(
     # reweight the radius and thickness of the skeleton
     base_radius = int(round(radius * scale_ratio))
     base_thickness = int(round(thickness * scale_ratio))
+<<<<<<< HEAD
     _max_bone_px = max_bone_frac * np.sqrt(out_kpmap_shape[0] ** 2 + out_kpmap_shape[1] ** 2) if max_bone_frac else None
+=======
+>>>>>>> 8b14099 (Update to Sapiens 2 for pose detection)
 
     # draw skeleton
     lines = []
