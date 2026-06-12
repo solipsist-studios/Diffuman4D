@@ -200,6 +200,10 @@ def _infer_image_size(images_dir: Path) -> tuple[int, int]:
     )
 
 
+def _count_input_images(image_dir: Path) -> int:
+    return sum(1 for path in image_dir.iterdir() if path.is_file())
+
+
 def _camera_name_score(name: str) -> int:
     normalized = name.strip().lower()
     if not normalized:
@@ -243,6 +247,260 @@ def _resolve_camera_export_name(
     output_suffix = image_path.suffix
     output_file_name = f'{camera_label}{output_suffix}' if output_suffix else camera_label
     return camera_label, output_file_name
+
+
+def _normalized_path(path_like: str) -> str:
+    normalized = str(path_like).replace('\\', '/')
+    normalized = normalized.lstrip('./')
+    return Path(normalized).as_posix()
+
+
+def _path_lookup_keys(path_like: str) -> list[str]:
+    normalized = _normalized_path(path_like)
+    keys = [normalized]
+    if normalized.startswith('images/'):
+        keys.append(normalized[len('images/'):])
+    keys.append(Path(normalized).name)
+
+    deduped: list[str] = []
+    for key in keys:
+        if key and key not in deduped:
+            deduped.append(key)
+    return deduped
+
+
+def _normalize_label_token(label: str) -> str:
+    token = str(label).strip().lower()
+    if token.isdigit():
+        return str(int(token))
+    return token
+
+
+def _camera_label_candidates_from_image_name(image_name: str) -> list[str]:
+    normalized = _normalized_path(image_name)
+    path = Path(normalized)
+
+    candidates: list[str] = []
+    if path.parent.as_posix() not in ('', '.'):
+        candidates.append(path.parent.name)
+
+    # Handle names like 0001_0001.mp4.thumb.jpg by reducing to 0001_0001.
+    stem = path.stem
+    stem_primary = stem.split('.')[0]
+    if stem_primary:
+        candidates.append(stem_primary)
+
+        # Add tokenized candidates in an order that prefers camera-like suffix tokens.
+        # Example: 0001_0012 -> prefer 0012 over 0001.
+        split_tokens = [token for token in re.split(r'[_\-]', stem_primary) if token]
+        for token in reversed(split_tokens):
+            candidates.append(token)
+        for token in split_tokens:
+            candidates.append(token)
+
+    normalized_candidates: list[str] = []
+    for candidate in candidates:
+        normalized_candidate = _normalize_label_token(candidate)
+        if normalized_candidate and normalized_candidate not in normalized_candidates:
+            normalized_candidates.append(normalized_candidate)
+
+    return normalized_candidates
+
+
+def _camera_label_frequency_candidates_from_image_name(image_name: str) -> list[str]:
+    normalized = _normalized_path(image_name)
+    path = Path(normalized)
+
+    candidates: list[str] = []
+    if path.parent.as_posix() not in ('', '.'):
+        candidates.append(path.parent.name)
+
+    stem_primary = path.stem.split('.')[0]
+    if stem_primary:
+        split_tokens = [token for token in re.split(r'[_\-]', stem_primary) if token]
+        candidates.extend(split_tokens)
+
+    normalized_candidates: list[str] = []
+    for candidate in candidates:
+        normalized_candidate = _normalize_label_token(candidate)
+        if normalized_candidate:
+            normalized_candidates.append(normalized_candidate)
+    return normalized_candidates
+
+
+def _build_label_token_frequency(image_names: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for image_name in image_names:
+        for candidate in _camera_label_frequency_candidates_from_image_name(image_name):
+            counts[candidate] = counts.get(candidate, 0) + 1
+    return counts
+
+
+def _build_frame_intrinsics_lookup(frames: list[dict]) -> tuple[dict[str, dict], set[str], dict[str, dict], set[str]]:
+    lookup: dict[str, dict] = {}
+    ambiguous: set[str] = set()
+    label_lookup: dict[str, dict] = {}
+    ambiguous_labels: set[str] = set()
+    for frame in frames:
+        file_path = frame.get('file_path')
+        if not isinstance(file_path, str) or not file_path:
+            continue
+        for key in _path_lookup_keys(file_path):
+            previous = lookup.get(key)
+            if previous is not None and previous is not frame:
+                ambiguous.add(key)
+                continue
+            lookup[key] = frame
+
+        camera_label = frame.get('camera_label')
+        if camera_label is not None:
+            normalized_label = _normalize_label_token(camera_label)
+            if normalized_label:
+                previous_label_frame = label_lookup.get(normalized_label)
+                if previous_label_frame is not None and previous_label_frame is not frame:
+                    ambiguous_labels.add(normalized_label)
+                else:
+                    label_lookup[normalized_label] = frame
+
+    for key in ambiguous:
+        lookup.pop(key, None)
+    for label in ambiguous_labels:
+        label_lookup.pop(label, None)
+    return lookup, ambiguous, label_lookup, ambiguous_labels
+
+
+def _find_frame_intrinsics_for_image_name(
+    image_name: str,
+    frame_lookup: dict[str, dict],
+    ambiguous_keys: set[str],
+    frame_label_lookup: dict[str, dict],
+    ambiguous_labels: set[str],
+    label_token_frequency: dict[str, int],
+) -> tuple[dict, str]:
+    for key in _path_lookup_keys(image_name):
+        if key in frame_lookup:
+            return frame_lookup[key], 'exact'
+        if key in ambiguous_keys:
+            raise ValueError(
+                f'Image {image_name!r} matched an ambiguous frame key {key!r}. '
+                'Use unique file_path values in transforms frames.'
+            )
+
+    # Fallback for extracted names that may not match frame file_path exactly,
+    # e.g. 0001_0001.mp4.thumb.jpg.
+    matched_candidates: list[tuple[int, str]] = []
+    for label_candidate in _camera_label_candidates_from_image_name(image_name):
+        if label_candidate in ambiguous_labels:
+            raise ValueError(
+                f'Image {image_name!r} matched an ambiguous camera label {label_candidate!r}. '
+                'Provide unique camera_label values in transforms frames.'
+            )
+        if label_candidate in frame_label_lookup:
+            frequency = label_token_frequency.get(label_candidate, 10**9)
+            matched_candidates.append((frequency, label_candidate))
+
+    if matched_candidates:
+        matched_candidates.sort(key=lambda item: (item[0], item[1]))
+        best_frequency, best_label = matched_candidates[0]
+        equally_good = [label for freq, label in matched_candidates if freq == best_frequency]
+        if len(equally_good) > 1:
+            raise ValueError(
+                f'Image {image_name!r} matched multiple equally likely camera labels {equally_good}. '
+                'Please make frame file_path values match image names more directly.'
+            )
+        return frame_label_lookup[best_label], 'fallback'
+
+    raise KeyError(
+        f'No frame intrinsics found for COLMAP image {image_name!r}. '
+        'Ensure transforms frame file_path values match image paths under images_dir.'
+    )
+
+
+def _run_reconstruction_with_per_frame_intrinsics(
+    sfm_dir: Path,
+    image_dir: Path,
+    pairs: Path,
+    features: Path,
+    matches: Path,
+    frames: list[dict],
+    camera_model_name: str,
+    mapper_options: dict,
+) -> pycolmap.Reconstruction:
+    assert features.exists(), features
+    assert pairs.exists(), pairs
+    assert matches.exists(), matches
+
+    sfm_dir.mkdir(parents=True, exist_ok=True)
+    database = sfm_dir / 'database.db'
+
+    pycolmap.logging.set_log_destination(pycolmap.logging.INFO, sfm_dir / 'colmap.LOG.')
+
+    reconstruction.create_empty_db(database)
+    reconstruction.import_images(
+        image_dir,
+        database,
+        pycolmap.CameraMode.PER_IMAGE,
+        image_list=None,
+        options={'camera_model': camera_model_name},
+    )
+
+    frame_lookup, ambiguous_keys, frame_label_lookup, ambiguous_labels = _build_frame_intrinsics_lookup(frames)
+    image_ids = reconstruction.get_image_ids(database)
+    image_names = list(image_ids.keys())
+    label_token_frequency = _build_label_token_frequency(image_names)
+
+    if len(frames) < len(image_names):
+        raise ValueError(
+            'Per-frame intrinsics were requested, but input transforms has fewer frames '
+            f'({len(frames)}) than imported images ({len(image_names)}). '
+            'This usually means the wrong transforms file was provided '
+            '(for example, a previously reduced output transforms_hloc.json).'
+        )
+
+    exact_match_count = 0
+    fallback_match_count = 0
+
+    with pycolmap.Database.open(database) as db:
+        for db_image in db.read_all_images():
+            frame_intrinsics, match_mode = _find_frame_intrinsics_for_image_name(
+                db_image.name,
+                frame_lookup,
+                ambiguous_keys,
+                frame_label_lookup,
+                ambiguous_labels,
+                label_token_frequency,
+            )
+            if match_mode == 'exact':
+                exact_match_count += 1
+            else:
+                fallback_match_count += 1
+            camera = load_camera_from_transforms(frame_intrinsics)
+            camera.camera_id = db_image.camera_id
+            db.update_camera(camera)
+
+        reconstruction.import_features(image_ids, db, features)
+        reconstruction.import_matches(
+            image_ids,
+            db,
+            pairs,
+            matches,
+            min_match_score=None,
+            skip_geometric_verification=False,
+        )
+
+    reconstruction.estimation_and_geometric_verification(database, pairs, verbose=False)
+    print(
+        'Per-frame intrinsics matching summary: '
+        f'{exact_match_count} exact, {fallback_match_count} fallback, '
+        f'{len(image_names)} total images.'
+    )
+    return reconstruction.run_reconstruction(
+        sfm_dir,
+        database,
+        image_dir,
+        verbose=False,
+        options=mapper_options,
+    )
 
 
 def load_transforms_from_pkl(
@@ -398,6 +656,7 @@ def main() -> None:
         raise FileNotFoundError(f'images_dir does not exist or is not a directory: {images_dir}')
 
     outputs_dir.mkdir(parents=True, exist_ok=True)
+    num_input_images = _count_input_images(images_dir)
 
     sfm_pairs = outputs_dir / 'pairs-exhaustive.txt'
     sfm_dir = outputs_dir / 'sfm_reconstruction'
@@ -430,6 +689,7 @@ def main() -> None:
         )
 
     use_per_frame_intrinsics = _can_load_per_frame_intrinsics(transforms)
+    per_frame_model = None
 
     if use_per_frame_intrinsics:
         frame_models = {str(frame.get('camera_model', '')).upper() for frame in transforms['frames']}
@@ -439,13 +699,9 @@ def main() -> None:
             )
 
         per_frame_model = next(iter(frame_models))
-        camera_mode = pycolmap.CameraMode.PER_IMAGE
-        image_options_dict = {
-            'camera_model': per_frame_model,
-        }
         print(
             'Using per-frame intrinsics from input transforms frames '
-            f'(camera_mode={camera_mode.name}, camera_model={per_frame_model}).'
+            f'(camera_mode={pycolmap.CameraMode.PER_IMAGE.name}, camera_model={per_frame_model}).'
         )
 
         if transforms.get('w') is None or transforms.get('h') is None:
@@ -461,14 +717,13 @@ def main() -> None:
             print(f'Inferred image size: {w}x{h}')
 
         global_camera = load_camera_from_transforms(transforms)
-        camera_mode = pycolmap.CameraMode.SINGLE
-        image_options_dict = {
+        global_image_options = {
             'camera_model': global_camera.model.name,
             'camera_params': ','.join(str(float(value)) for value in global_camera.params)
         }
         print(
             'Using global intrinsics from top-level transforms '
-            f'(camera_mode={camera_mode.name}, camera_model={global_camera.model.name}).'
+            f'(camera_mode={pycolmap.CameraMode.SINGLE.name}, camera_model={global_camera.model.name}).'
         )
 
     print("Running COLMAP reconstruction...")
@@ -485,18 +740,53 @@ def main() -> None:
         #"ba_local_max_num_iterations": 50
     }
 
-    model = reconstruction.main(
-        sfm_dir,
-        images_dir,
-        sfm_pairs,
-        feature_path,
-        match_path,
-        camera_mode=camera_mode,
-        image_options=image_options_dict,
-        mapper_options=mapper_options_dict
-    )
+    if use_per_frame_intrinsics:
+        # In PER_IMAGE mode each camera is typically observed by a single image.
+        # Refining intrinsics then becomes ill-posed and can fragment the mapping.
+        mapper_options_dict.update(
+            {
+                "ba_refine_focal_length": False,
+                "ba_refine_extra_params": False,
+                "ba_refine_principal_point": False,
+                "multiple_models": False,
+                "max_num_models": 1,
+            }
+        )
+        print(
+            "Per-frame mode: locking camera intrinsics and restricting COLMAP to a single model "
+            "for stable multi-view registration."
+        )
+
+    if use_per_frame_intrinsics:
+        model = _run_reconstruction_with_per_frame_intrinsics(
+            sfm_dir=sfm_dir,
+            image_dir=images_dir,
+            pairs=sfm_pairs,
+            features=feature_path,
+            matches=match_path,
+            frames=transforms['frames'],
+            camera_model_name=per_frame_model,
+            mapper_options=mapper_options_dict,
+        )
+    else:
+        model = reconstruction.main(
+            sfm_dir,
+            images_dir,
+            sfm_pairs,
+            feature_path,
+            match_path,
+            camera_mode=pycolmap.CameraMode.SINGLE,
+            image_options=global_image_options,
+            mapper_options=mapper_options_dict
+        )
+
+    if model is None:
+        raise RuntimeError('COLMAP reconstruction failed. No valid model was reconstructed.')
 
     print(f"Reconstruction complete! Reconstructed {model.num_reg_images()} images.")
+    print('Reconstruction statistics:')
+    print(model.summary())
+    print(f'\tnum_input_images = {num_input_images}')
 
     refined_intrinsics_by_camera_id = {
         camera_id: _intrinsics_from_colmap_camera(camera)
@@ -506,15 +796,30 @@ def main() -> None:
     if not refined_intrinsics_by_camera_id:
         raise RuntimeError('No reconstructed cameras were found after COLMAP reconstruction.')
 
-    if len(refined_intrinsics_by_camera_id) > 1:
+    if use_per_frame_intrinsics:
+        expected_camera_count = len(transforms.get('frames', []))
+        reconstructed_camera_count = len(refined_intrinsics_by_camera_id)
+        if reconstructed_camera_count != expected_camera_count:
+            print(
+                'WARNING: Reconstructed camera model count does not match per-frame input count: '
+                f'expected={expected_camera_count}, reconstructed={reconstructed_camera_count}. '
+                'This usually indicates partial registration or mismatched intrinsics.'
+            )
         print(
-            'COLMAP produced multiple camera models; writing refined intrinsics per frame '
-            'and using the first camera as top-level intrinsics.'
+            f'Per-frame mode: reconstructed {len(refined_intrinsics_by_camera_id)} camera model(s), '
+            'which is expected for multi-camera input.'
         )
-
-    first_refined_intrinsics = next(iter(refined_intrinsics_by_camera_id.values()))
-    for key, value in first_refined_intrinsics.items():
-        transforms[key] = value
+        for key in ['camera_model', 'w', 'h', 'fl_x', 'fl_y', 'cx', 'cy', 'k1', 'k2', 'k3', 'k4', 'p1', 'p2']:
+            transforms.pop(key, None)
+    else:
+        if len(refined_intrinsics_by_camera_id) > 1:
+            print(
+                'WARNING: Single-camera mode expected one camera model, '
+                f'but COLMAP reconstructed {len(refined_intrinsics_by_camera_id)} camera models.'
+            )
+        first_refined_intrinsics = next(iter(refined_intrinsics_by_camera_id.values()))
+        for key, value in first_refined_intrinsics.items():
+            transforms[key] = value
 
     # Extract poses from the PyCOLMAP Reconstruction object
     # The 'model' variable is what was returned by reconstruction.main()
@@ -622,6 +927,12 @@ def main() -> None:
 
     # 4. Optionally save refined intrinsics back to a calibration .pkl
     if args.output_calibration is not None:
+        if use_per_frame_intrinsics:
+            raise ValueError(
+                'output_calibration is not supported in per-frame mode because a single calibration .pkl '
+                'cannot represent multiple per-camera intrinsics. Omit --output_calibration or run with global intrinsics.'
+            )
+
         fl_x = transforms['fl_x']
         fl_y = transforms.get('fl_y', fl_x)
         cx = transforms['cx']
