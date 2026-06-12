@@ -6,3 +6,4 @@ __pycache__
 /output
 /sapiens/lite/torchscript/pose/checkpoints/**
 /sapiens/lite/detector/checkpoints/**
+/configs/exp/**
