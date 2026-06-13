@@ -22,9 +22,11 @@ def visualize_keypoints(
     kpt_color: list | tuple | np.ndarray | None = None,
     link_color: list | tuple | np.ndarray | None = None,
     show_kpt_idx: bool = False,
+    max_bone_frac: float = 0.35,  # skip links longer than this fraction of image diagonal
 ) -> np.ndarray:
     img = image.copy()
     H, W = img.shape[:2]
+    _max_bone_px = max_bone_frac * np.sqrt(H ** 2 + W ** 2) if max_bone_frac else None
 
     # defaults
     if skeleton is None:
@@ -85,6 +87,8 @@ def visualize_keypoints(
             x1, y1 = map(int, np.round(kpts[i]))
             x2, y2 = map(int, np.round(kpts[j]))
             if not (in_bounds(x1, y1) and in_bounds(x2, y2)):
+                continue
+            if _max_bone_px is not None and np.hypot(x2 - x1, y2 - y1) > _max_bone_px:
                 continue
 
             cv2.line(
