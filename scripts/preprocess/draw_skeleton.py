@@ -101,6 +101,7 @@ def draw_one_skeleton(
     image_quality=85,
     draw_face_keypoints=False,
     skip_exists=False,
+    max_bone_frac: float = 0.35,  # skip links longer than this fraction of canvas diagonal
 ):
     if skip_exists and os.path.exists(out_kpmap_path):
         try:
@@ -174,6 +175,7 @@ def draw_one_skeleton(
     # reweight the radius and thickness of the skeleton
     base_radius = int(round(radius * scale_ratio))
     base_thickness = int(round(thickness * scale_ratio))
+    _max_bone_px = max_bone_frac * np.sqrt(out_kpmap_shape[0] ** 2 + out_kpmap_shape[1] ** 2) if max_bone_frac else None
 
     # draw skeleton
     lines = []
@@ -196,6 +198,8 @@ def draw_one_skeleton(
         p1, p2 = kpts[i1], kpts[i2]
         x1, y1 = int(round(p1[0])), int(round(p1[1]))
         x2, y2 = int(round(p2[0])), int(round(p2[1]))
+        if _max_bone_px is not None and np.hypot(x2 - x1, y2 - y1) > _max_bone_px:
+            continue
         d1, d2 = float(depths[i1]), float(depths[i2])
         d = (d1 + d2) / 2
 

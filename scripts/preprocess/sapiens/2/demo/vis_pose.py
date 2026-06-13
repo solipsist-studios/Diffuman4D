@@ -51,9 +51,17 @@ def _get_detector(device, ckpt_dir):
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
+                category=FutureWarning,
                 message=r"The `max_size` parameter is deprecated.*",
             )
             _detector_cache["proc"] = DetrImageProcessor.from_pretrained(ckpt_dir)
+
+        # Normalize to the newer size schema to avoid repeated deprecation warnings.
+        proc_size = getattr(_detector_cache["proc"], "size", None)
+        if isinstance(proc_size, dict) and "max_size" in proc_size and "longest_edge" not in proc_size:
+            patched = dict(proc_size)
+            patched["longest_edge"] = patched.pop("max_size")
+            _detector_cache["proc"].size = patched
 
         prev_verbosity = hf_logging.get_verbosity()
         try:
@@ -136,6 +144,256 @@ def _score_bbox_vs_mask(bbox: np.ndarray, mask: np.ndarray) -> tuple[float, floa
     overlap_ratio = intersect / bbox_area
     mask_coverage = intersect / max(1.0, mask_total)
     return overlap_ratio, mask_coverage
+
+
+def _apply_bone_length_filter(
+    keypoints: list,
+    keypoint_scores: list,
+    skeleton_links: list,
+    max_bone_sigma: float,
+    max_bilateral_ratio: float,
+    flip_pairs: list[tuple[int, int]] | None = None,
+    keypoint_info: dict | None = None,
+) -> list:
+    """Zero out the score of the lower-confidence endpoint of any link whose
+    length is a statistical outlier relative to the *other bones in the same
+    instance*.
+
+     Two complementary checks are available:
+
+     1. **Bilateral symmetry** — when left/right pairing metadata is supplied, every link
+         is compared against its mirror counterpart (e.g. left-forearm vs
+         right-forearm).  If one side is more than ``max_bilateral_ratio`` times
+         longer than the other, the longer side's lower-confidence endpoint is
+         zeroed.  This is the default because it compares like-with-like rather
+         than mixing torso, hand, and facial scales into one distribution.
+
+     2. **MAD outlier** — optional. Computes median + MAD of all bone lengths in
+         the instance and flags any bone more than ``max_bone_sigma`` sigma above
+         the median.  For the 308-keypoint whole-body graph this can be too
+         aggressive because the graph mixes very small distal links with large
+         torso/limb links, so it is disabled by default.
+
+    A zeroed score propagates to triangulate_skeleton's score_thr gate so the
+    bad point is excluded from 3-D reconstruction.
+
+    Returns a new list of score arrays (originals untouched).
+    """
+    if (not max_bone_sigma and not max_bilateral_ratio) or not skeleton_links:
+        return keypoint_scores
+
+    adjacency: dict[int, set[int]] = {}
+    for i, j in skeleton_links:
+        adjacency.setdefault(i, set()).add(j)
+        adjacency.setdefault(j, set()).add(i)
+
+    node_degree = {idx: len(neighbors) for idx, neighbors in adjacency.items()}
+
+    # Protect the core body graph from suppression.  The linked whole-body
+    # topology here uses low ids for the torso / face scaffold, while distal
+    # foot and hand chains fan out from those protected roots.
+    protected_nodes = {
+        idx for idx, degree in node_degree.items()
+        if idx <= 14 or degree >= 3
+    }
+
+    node_depth: dict[int, int] = {}
+    frontier = [(idx, 0) for idx in protected_nodes]
+    while frontier:
+        idx, depth = frontier.pop(0)
+        for neighbor in adjacency.get(idx, ()): 
+            if neighbor in protected_nodes or neighbor in node_depth:
+                continue
+            node_depth[neighbor] = depth + 1
+            frontier.append((neighbor, depth + 1))
+
+    def _link_is_distal(i: int, j: int) -> bool:
+        return (i in node_depth) or (j in node_depth)
+
+    def _select_suspicious_endpoint(i: int, j: int, scores: np.ndarray) -> int | None:
+        """Pick the endpoint most likely to be the hallucinated point.
+
+        Only suppress non-core distal-chain points. Prefer the endpoint that is
+        farther from the protected body/hand root over deleting any shared or
+        proximal articulation. Only fall back to confidence for ties, and skip
+        fully ambiguous cases.
+        """
+        depth_i = node_depth.get(i)
+        depth_j = node_depth.get(j)
+        score_i = float(scores[i])
+        score_j = float(scores[j])
+
+        if depth_i is None and depth_j is None:
+            return None
+        if depth_i is None:
+            return j
+        if depth_j is None:
+            return i
+        if depth_i != depth_j:
+            return i if depth_i > depth_j else j
+
+        deg_i = len(adjacency.get(i, ()))
+        deg_j = len(adjacency.get(j, ()))
+        if deg_i != deg_j:
+            return i if deg_i < deg_j else j
+
+        if abs(score_i - score_j) >= 0.15:
+            return i if score_i < score_j else j
+
+        # Degrees and confidences are too similar; do not guess.
+        return None
+
+    def _link_confidence(i: int, j: int, scores: np.ndarray) -> tuple[float, float]:
+        """Return conservative and average confidence for one link."""
+        score_i = float(scores[i])
+        score_j = float(scores[j])
+        return min(score_i, score_j), 0.5 * (score_i + score_j)
+
+    def _should_suppress_longer_link(
+        longer_link: tuple[int, int],
+        shorter_link: tuple[int, int],
+        scores: np.ndarray,
+    ) -> bool:
+        """Only let a mirrored link veto the other side when it is reliable.
+
+        This avoids deleting a good visible hand because the opposite hand is
+        partially occluded, short, or otherwise low-confidence.
+        """
+        longer_min, longer_avg = _link_confidence(*longer_link, scores)
+        shorter_min, shorter_avg = _link_confidence(*shorter_link, scores)
+
+        # A weak mirrored link is not a trustworthy reference.
+        if shorter_min < 0.35:
+            return False
+
+        # If the candidate longer link is materially better supported than the
+        # shorter mirrored link, prefer to keep it; the shorter side is likely
+        # the occluded / degraded observation.
+        if longer_min > shorter_min + 0.10:
+            return False
+        if longer_avg > shorter_avg + 0.10:
+            return False
+
+        return True
+
+    # ── pre-compute bilateral link pairs from left/right metainfo ──────────
+    bilateral_pairs: list[tuple[tuple, tuple]] = []
+    swap_id: dict[int, int] = {}
+    if flip_pairs:
+        for left_idx, right_idx in flip_pairs:
+            try:
+                left_idx = int(left_idx)
+                right_idx = int(right_idx)
+            except (TypeError, ValueError):
+                continue
+            swap_id[left_idx] = right_idx
+    elif isinstance(keypoint_info, dict):
+        # Fallback for metainfo variants that expose named swap partners.
+        normalized_info: dict[int, dict] = {}
+        for raw_idx, info in keypoint_info.items():
+            if not isinstance(info, dict):
+                continue
+            if "name" not in info:
+                continue
+            idx = info.get("id", raw_idx)
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                continue
+            normalized_info[idx] = info
+
+        name_to_id = {
+            info["name"]: idx
+            for idx, info in normalized_info.items()
+            if isinstance(info.get("name"), str)
+        }
+        for idx, info in normalized_info.items():
+            swap_name = info.get("swap", "")
+            if swap_name and swap_name in name_to_id:
+                swap_id[idx] = name_to_id[swap_name]
+
+    if swap_id:
+        link_set = {(i, j) for i, j in skeleton_links} | {(j, i) for i, j in skeleton_links}
+        seen: set = set()
+        for i, j in skeleton_links:
+            si, sj = swap_id.get(i), swap_id.get(j)
+            if si is None or sj is None:
+                continue
+            if (si, sj) not in link_set and (sj, si) not in link_set:
+                continue
+            canonical = tuple(sorted([(i, j), (si, sj)]))
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            bilateral_pairs.append(((i, j), (si, sj)))
+
+    filtered = [s.copy() for s in keypoint_scores]
+
+    for kpts, scores in zip(keypoints, filtered):
+        n = len(kpts)
+
+        # ── step 1: optional MAD outlier across all bones ──────────────────
+        lengths: list[float] = []
+        per_link_lengths: list[float | None] = []
+        for i, j in skeleton_links:
+            if i >= n or j >= n:
+                per_link_lengths.append(None)
+                continue
+            d = float(np.linalg.norm(kpts[i] - kpts[j]))
+            per_link_lengths.append(d)
+            if not _link_is_distal(i, j):
+                continue
+            # Only include high-confidence bones in the reference distribution
+            # so that a cluster of jank bones does not inflate the median.
+            if scores[i] > 0.3 and scores[j] > 0.3:
+                lengths.append(d)
+
+        if max_bone_sigma and len(lengths) >= 5:
+            arr = np.asarray(lengths, dtype=np.float64)
+            median = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - median)))
+            # Floor MAD so a perfectly uniform skeleton still has a finite gate.
+            mad = max(mad, median * 0.1)
+            threshold = median + max_bone_sigma * mad
+
+            for (i, j), d in zip(skeleton_links, per_link_lengths):
+                if d is None or d <= threshold:
+                    continue
+                if i >= n or j >= n:
+                    continue
+                if not _link_is_distal(i, j):
+                    continue
+                bad_idx = _select_suspicious_endpoint(i, j, scores)
+                if bad_idx is not None:
+                    scores[bad_idx] = 0.0
+
+        # ── step 2: bilateral symmetry ─────────────────────────────────────
+        for (i, j), (si, sj) in bilateral_pairs:
+            if i >= n or j >= n or si >= n or sj >= n:
+                continue
+            if not max_bilateral_ratio:
+                continue
+            if not _link_is_distal(i, j):
+                continue
+            d1 = float(np.linalg.norm(kpts[i] - kpts[j]))
+            d2 = float(np.linalg.norm(kpts[si] - kpts[sj]))
+            if d1 < 1e-6 or d2 < 1e-6:
+                continue
+            ratio = d1 / d2
+            if ratio > max_bilateral_ratio:
+                if not _should_suppress_longer_link((i, j), (si, sj), scores):
+                    continue
+                bad_idx = _select_suspicious_endpoint(i, j, scores)
+                if bad_idx is not None:
+                    scores[bad_idx] = 0.0
+            elif 1.0 / ratio > max_bilateral_ratio:
+                if not _should_suppress_longer_link((si, sj), (i, j), scores):
+                    continue
+                bad_idx = _select_suspicious_endpoint(si, sj, scores)
+                if bad_idx is not None:
+                    scores[bad_idx] = 0.0
+
+    return filtered
 
 
 def _filter_bboxes_by_mask(bboxes: np.ndarray, mask: np.ndarray | None, min_overlap: float) -> np.ndarray:
@@ -245,6 +503,29 @@ def process_one_image(args, image, model, fg_mask: np.ndarray | None = None):
         keypoints.append(keypoints_i[0])  ## remove fake batch dim
         keypoint_scores.append(keypoint_scores_i[0])  ## remove fake batch dim
 
+    # Zero scores for endpoints of anatomically implausible bones so they are
+    # excluded from both the JSON output and triangulation downstream.
+    meta = getattr(model, "pose_metainfo", {})
+    skeleton_links = meta.get("skeleton_links", []) if isinstance(meta, dict) else []
+    flip_pairs = meta.get("flip_pairs", []) if isinstance(meta, dict) else []
+    keypoint_info = None
+    if isinstance(meta, dict):
+        if isinstance(meta.get("keypoint_info", None), dict):
+            keypoint_info = meta["keypoint_info"]
+        elif isinstance(meta.get("coco_wholebody_to_goliath_keypoint_info", None), dict):
+            keypoint_info = meta["coco_wholebody_to_goliath_keypoint_info"]
+    max_bone_sigma = getattr(args, "max_bone_sigma", 0.0)
+    max_bilateral_ratio = getattr(args, "max_bilateral_ratio", 3.5)
+    keypoint_scores = _apply_bone_length_filter(
+        keypoints,
+        keypoint_scores,
+        skeleton_links,
+        max_bone_sigma,
+        max_bilateral_ratio,
+        flip_pairs,
+        keypoint_info,
+    )
+
     return keypoints, keypoint_scores, bboxes
 
 
@@ -284,6 +565,28 @@ def main():
         type=int,
         default=None,
         help="Maximum number of detected subjects to keep per frame after mask filtering",
+    )
+    parser.add_argument(
+        "--max-bone-frac",
+        type=float,
+        default=0.35,
+        help="Visual-only: bones longer than this fraction of the image diagonal are skipped "
+             "when drawing the skeleton overlay.",
+    )
+    parser.add_argument(
+        "--max-bone-sigma",
+        type=float,
+        default=0.0,
+        help="Optional JSON-level MAD filter: zero the lower-confidence endpoint of any bone "
+             "whose length exceeds median + N*MAD across the instance's own bone distribution. "
+             "Disabled by default because whole-body links span multiple natural scales.",
+    )
+    parser.add_argument(
+        "--max-bilateral-ratio",
+        type=float,
+        default=3.5,
+        help="JSON-level bilateral filter: if one mirrored link is longer than this ratio times "
+             "its counterpart, zero the longer link's lower-confidence endpoint. Set 0 to disable.",
     )
     parser.add_argument(
         "--no-save-json",
