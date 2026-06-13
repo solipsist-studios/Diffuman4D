@@ -114,7 +114,7 @@ def remove_background(
         model_name: str
             "briaai/RMBG-2.0": for general background removal.
             "ZhengPeng7/BiRefNet": for general background removal.
-            "ZhengPeng7/BiRefNet": for human segmentation.
+            "ZhengPeng7/BiRefNet-portrait": for human segmentation.
         batch_size: int
             The number of images to process in a single batch. Recommended to be GPU memory // 2.
     """
