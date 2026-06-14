@@ -850,7 +850,7 @@ def main() -> None:
 
         # Append to our frames list
         frame_entry = {
-            "file_path": f"images\\{output_file_name}",
+            "file_path": os.path.join("images", output_file_name),
             "camera_label": camera_label,
             "transform_matrix": c2w_matrix.tolist()
         }
