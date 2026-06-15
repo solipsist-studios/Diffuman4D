@@ -461,7 +461,9 @@ def process_one_image(args, image, model, fg_mask: np.ndarray | None = None):
     bboxes = _detect_persons(image, args)
     bboxes = _filter_bboxes_by_mask(bboxes, fg_mask, args.mask_bbox_overlap_thr)
     bboxes = _limit_subjects(bboxes, fg_mask, args.max_subjects)
-
+    if bboxes is None or len(bboxes) == 0:
+        h, w = image.shape[:2]
+        bboxes = np.asarray([[0.0, 0.0, float(w), float(h)]], dtype=np.float32)
     inputs_list = []
     data_samples_list = []
     for bbox in bboxes:
