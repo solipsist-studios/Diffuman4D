@@ -569,13 +569,6 @@ def main():
         help="Maximum number of detected subjects to keep per frame after mask filtering",
     )
     parser.add_argument(
-        "--max-bone-frac",
-        type=float,
-        default=0.35,
-        help="Visual-only: bones longer than this fraction of the image diagonal are skipped "
-             "when drawing the skeleton overlay.",
-    )
-    parser.add_argument(
         "--max-bone-sigma",
         type=float,
         default=0.0,
