@@ -66,12 +66,17 @@ def project_points(kp3d, Ks, Ts, kp3d_score=None, use_cuda: bool = False):
 
     # update keypoint score based on face normal and camera normal
     def get_face_normal(kp3d_np):
+        if kp3d_np.shape[0] < 3:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
         nose, left_eye, right_eye = kp3d_np[:3]
         eye_mid = (left_eye + right_eye) / 2
         v1 = right_eye - left_eye
         v2 = nose - eye_mid
         normal = np.cross(v1, v2)
-        normal /= np.linalg.norm(normal)
+        norm = np.linalg.norm(normal)
+        if norm < 1e-9:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        normal /= norm
         return normal
 
     if kp3d_score is not None:
@@ -79,8 +84,12 @@ def project_points(kp3d, Ks, Ts, kp3d_score=None, use_cuda: bool = False):
         cam_normal = Ts[:, 2, :3]
         face_cam_cos = -np.dot(cam_normal, face_normal)
         face_cam_score = face_cam_cos * 0.5 + 0.5
-        kp2d_score[:, :3] *= face_cam_score[:, None]
-        kp2d_score[:, 23:91] *= face_cam_score[:, None]
+        n_kpts = kp2d_score.shape[1]
+        if n_kpts >= 3:
+            kp2d_score[:, :3] *= face_cam_score[:, None]
+        if n_kpts > 23:
+            face_end = min(91, n_kpts)
+            kp2d_score[:, 23:face_end] *= face_cam_score[:, None]
 
     return kp2d, kp2d_depth, kp2d_score
 
