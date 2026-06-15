@@ -185,7 +185,6 @@ def predict_keypoints(
     config_path: str = None,
     detector_ckpt_path: str = f"{ckpt_root}/detector/detr-resnet-101-dc5",
     gpu_ids: tuple[int, ...] | None = None,
-    num_workers: int = 4,
     kpt_thr: float = 0.3,
     save_img: bool | None = None,
     image_ext: str = ".jpg",
