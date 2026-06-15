@@ -201,8 +201,7 @@ def _infer_image_size(images_dir: Path) -> tuple[int, int]:
 
 
 def _count_input_images(image_dir: Path) -> int:
-    return sum(1 for path in image_dir.iterdir() if path.is_file())
-
+    return sum(1 for path in image_dir.rglob('*') if path.is_file())
 
 def _camera_name_score(name: str) -> int:
     normalized = name.strip().lower()
