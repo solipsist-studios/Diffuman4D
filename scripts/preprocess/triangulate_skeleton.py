@@ -84,7 +84,8 @@ def _detect_kp2d_source(kp2d_dir: str) -> tuple[str, str | None]:
     pred_candidates = [p for p in json_files if p.endswith("_predictions.json")]
     for candidate in pred_candidates + json_files:
         try:
-            payload = json.load(open(candidate, "r"))
+            with open(candidate, "r") as f:
+                payload = json.load(f)
             if isinstance(payload, dict) and isinstance(payload.get("frames", None), list):
                 return "combined_json", candidate
         except Exception:
@@ -163,7 +164,8 @@ def _load_combined_kp2d(
     dtype=np.float64,
 ) -> tuple[dict[tuple[str, str], tuple[np.ndarray, np.ndarray | None]], list[str], list[str]]:
     """Load combined predictions JSON and index by (camera_label, tem_label)."""
-    payload = json.load(open(combined_json_path, "r"))
+    with open(combined_json_path, "r") as f:
+        payload = json.load(f)
     frames = payload.get("frames", [])
     exact_map, stem_map = _build_image_to_cam_tem_map(camera_path)
 
