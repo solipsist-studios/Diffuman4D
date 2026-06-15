@@ -285,6 +285,9 @@ def predict_keypoints(
     cmd_parts.extend(["--max-bone-frac", str(max_bone_frac)])
     cmd_parts.extend(["--max-bone-sigma", str(max_bone_sigma)])
     cmd_parts.extend(["--max-bilateral-ratio", str(max_bilateral_ratio)])
+
+    device = f"cuda:{gpu_ids[0]}" if gpu_ids else "cpu"
+    cmd_parts.extend(["--device", device])
     
     if save_img is not None:
         print("Note: save_img is ignored for sapiens2; vis_pose.py always writes visualization images.")
