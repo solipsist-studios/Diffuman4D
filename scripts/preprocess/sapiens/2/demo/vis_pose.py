@@ -537,8 +537,8 @@ def main():
     parser.add_argument("det_checkpoint", help="Local DETR snapshot directory")
     parser.add_argument("config", help="Config file")
     parser.add_argument("checkpoint", help="Checkpoint file")
-    parser.add_argument("--input", help="Input image dir")
-    parser.add_argument("--output", default=None, help="Path to output dir")
+    parser.add_argument("--input", required=True, help="Input image dir")
+    parser.add_argument("--output", required=True, help="Path to output dir")
     parser.add_argument("--fmasks-dir", default=None, help="Foreground masks directory")
     parser.add_argument("--device", default="cuda:0", help="Device used for inference")
     parser.add_argument(
