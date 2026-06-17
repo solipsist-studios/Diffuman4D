@@ -27,7 +27,7 @@ from pose_render_utils import visualize_keypoints
 
 # DETR — COCO person = label 1.
 _detector_cache: dict = {}
-_MASK_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
 
 def _resolve_keypoints308_metainfo_file() -> str:
@@ -97,7 +97,7 @@ def _load_mask_for_image(mask_dir: str | None, image_name: str, image_shape: tup
     if not mask_dir:
         return None
     stem = Path(image_name).stem
-    for ext in _MASK_SUFFIXES:
+    for ext in _IMAGE_SUFFIXES:
         candidate = os.path.join(mask_dir, f"{stem}{ext}")
         if os.path.exists(candidate):
             mask = cv2.imread(candidate, cv2.IMREAD_GRAYSCALE)
@@ -457,10 +457,59 @@ def _limit_subjects(
     return bboxes[keep_ids]
 
 
+def _instance_pose_quality(scores: np.ndarray, kpt_thr: float) -> tuple[float, float, float]:
+    """Rank one instance by how likely it is to produce a usable skeleton."""
+    flat = np.asarray(scores, dtype=np.float32).reshape(-1)
+    if flat.size == 0:
+        return (0.0, 0.0, 0.0)
+
+    # Use a softer gate than visualization to avoid over-penalizing difficult frames.
+    weak_thr = max(0.15, float(kpt_thr) * 0.5)
+    num_confident = float(np.sum(flat >= weak_thr))
+
+    topk = min(20, flat.size)
+    if topk > 0:
+        topk_mean = float(np.mean(np.partition(flat, -topk)[-topk:]))
+    else:
+        topk_mean = 0.0
+    mean_score = float(np.mean(flat))
+    return (num_confident, topk_mean, mean_score)
+
+
+def _select_instances_by_pose_quality(
+    keypoints: list[np.ndarray],
+    keypoint_scores: list[np.ndarray],
+    bboxes: np.ndarray,
+    max_subjects: int | None,
+    kpt_thr: float,
+) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
+    if max_subjects is None or max_subjects <= 0 or len(keypoints) <= max_subjects:
+        return keypoints, keypoint_scores, bboxes
+
+    scored = []
+    for idx, scores in enumerate(keypoint_scores):
+        quality = _instance_pose_quality(scores, kpt_thr)
+        scored.append((idx, quality))
+
+    # Keep deterministic order in case of ties.
+    scored.sort(key=lambda x: (x[1][0], x[1][1], x[1][2], -x[0]), reverse=True)
+    keep = sorted([idx for idx, _ in scored[:max_subjects]])
+
+    kept_keypoints = [keypoints[idx] for idx in keep]
+    kept_scores = [keypoint_scores[idx] for idx in keep]
+    kept_bboxes = bboxes[keep]
+    return kept_keypoints, kept_scores, kept_bboxes
+
+
 def process_one_image(args, image, model, fg_mask: np.ndarray | None = None):
     bboxes = _detect_persons(image, args)
     bboxes = _filter_bboxes_by_mask(bboxes, fg_mask, args.mask_bbox_overlap_thr)
-    bboxes = _limit_subjects(bboxes, fg_mask, args.max_subjects)
+    # Keep a small candidate pool for inference, then choose final subjects by
+    # pose quality. This avoids max_subjects=1 picking a weak detection.
+    prelimit = None
+    if args.max_subjects is not None and args.max_subjects > 0:
+        prelimit = max(args.max_subjects * 4, args.max_subjects)
+    bboxes = _limit_subjects(bboxes, fg_mask, prelimit)
     if bboxes is None or len(bboxes) == 0:
         h, w = image.shape[:2]
         bboxes = np.asarray([[0.0, 0.0, float(w), float(h)]], dtype=np.float32)
@@ -526,6 +575,14 @@ def process_one_image(args, image, model, fg_mask: np.ndarray | None = None):
         max_bilateral_ratio,
         flip_pairs,
         keypoint_info,
+    )
+
+    keypoints, keypoint_scores, bboxes = _select_instances_by_pose_quality(
+        keypoints,
+        keypoint_scores,
+        bboxes,
+        args.max_subjects,
+        args.kpt_thr,
     )
 
     return keypoints, keypoint_scores, bboxes
@@ -621,7 +678,7 @@ def main():
         image_names = [
             name
             for name in sorted(os.listdir(input_dir))
-            if name.endswith((".jpg", ".png", ".jpeg"))
+            if name.lower().endswith(_IMAGE_SUFFIXES)
         ]
     else:
         with open(args.input, "r") as f:
@@ -647,7 +704,7 @@ def main():
             continue
 
         if image_size is None:
-            image_size = [int(image.shape[0]), int(image.shape[1])]
+            image_size = [int(image.shape[1]), int(image.shape[0])]
         if num_keypoints_seen is None and len(keypoints) > 0:
             num_keypoints_seen = int(np.asarray(keypoints[0]).shape[0])
 
