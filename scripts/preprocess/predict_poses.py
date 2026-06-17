@@ -201,7 +201,8 @@ def _infer_image_size(images_dir: Path) -> tuple[int, int]:
 
 
 def _count_input_images(image_dir: Path) -> int:
-    return sum(1 for path in image_dir.rglob('*') if path.is_file())
+    return sum(1 for path in image_dir.rglob('*') if path.is_file())
+
 
 def _camera_name_score(name: str) -> int:
     normalized = name.strip().lower()
@@ -505,6 +506,8 @@ def _run_reconstruction_with_per_frame_intrinsics(
 def load_transforms_from_pkl(
     pkl_path: Path,
     camera_model: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
 ) -> dict:
     """Load a calibration .pkl and return a transforms dict compatible with predict_poses.
 
@@ -542,6 +545,11 @@ def load_transforms_from_pkl(
     if image_size is not None and len(image_size) == 2:
         transforms['w'] = int(image_size[0])
         transforms['h'] = int(image_size[1])
+    else:
+        if width is not None:
+            transforms['w'] = int(width)
+        if height is not None:
+            transforms['h'] = int(height)
 
     if resolved_model == 'OPENCV_FISHEYE':
         transforms['k1'] = float(dist[0]) if dist.size > 0 else 0.0
@@ -557,6 +565,99 @@ def load_transforms_from_pkl(
     return transforms
 
 
+def _normalized_rel_to_images(images_dir: Path, image_path: Path) -> str:
+    rel = image_path.relative_to(images_dir).as_posix()
+    return f'images/{rel}'
+
+
+def _build_image_stem_maps(images_dir: Path) -> tuple[dict[str, list[Path]], dict[str, list[Path]]]:
+    by_stem: dict[str, list[Path]] = {}
+    by_primary_stem: dict[str, list[Path]] = {}
+    for path in sorted(images_dir.rglob('*')):
+        if not path.is_file():
+            continue
+        by_stem.setdefault(path.stem, []).append(path)
+        primary = path.stem.split('.')[0]
+        by_primary_stem.setdefault(primary, []).append(path)
+    return by_stem, by_primary_stem
+
+
+def _resolve_image_for_calibration_stem(
+    stem: str,
+    images_dir: Path,
+    by_stem: dict[str, list[Path]],
+    by_primary_stem: dict[str, list[Path]],
+) -> str:
+    exact = by_stem.get(stem, [])
+    if len(exact) == 1:
+        return _normalized_rel_to_images(images_dir, exact[0])
+    if len(exact) > 1:
+        raise ValueError(
+            f"Calibration stem {stem!r} matched multiple images by exact stem: "
+            f"{[p.name for p in exact]}."
+        )
+
+    primary = stem.split('.')[0]
+    fallback = by_primary_stem.get(primary, [])
+    if len(fallback) == 1:
+        return _normalized_rel_to_images(images_dir, fallback[0])
+    if len(fallback) > 1:
+        raise ValueError(
+            f"Calibration stem {stem!r} matched multiple images by primary stem {primary!r}: "
+            f"{[p.name for p in fallback]}."
+        )
+
+    return f'images/{stem}.jpg'
+
+
+def load_transforms_from_calibration_path(
+    calibration_path: Path,
+    images_dir: Path,
+    camera_model: str | None = None,
+) -> dict:
+    if not calibration_path.exists():
+        raise FileNotFoundError(f'Calibration path does not exist: {calibration_path}')
+
+    if calibration_path.is_file():
+        return load_transforms_from_pkl(calibration_path, camera_model=camera_model)
+
+    if not calibration_path.is_dir():
+        raise ValueError(f'Calibration path must be a file or directory: {calibration_path}')
+
+    pkl_files = sorted(path for path in calibration_path.iterdir() if path.is_file() and path.suffix.lower() == '.pkl')
+    if not pkl_files:
+        raise FileNotFoundError(f'No calibration .pkl files found in directory: {calibration_path}')
+
+    inferred_width, inferred_height = _infer_image_size(images_dir)
+    by_stem, by_primary_stem = _build_image_stem_maps(images_dir)
+
+    frames: list[dict] = []
+    for pkl_path in pkl_files:
+        intr = load_transforms_from_pkl(
+            pkl_path,
+            camera_model=camera_model,
+            width=inferred_width,
+            height=inferred_height,
+        )
+        file_path = _resolve_image_for_calibration_stem(
+            pkl_path.stem,
+            images_dir,
+            by_stem,
+            by_primary_stem,
+        )
+        frame = {
+            'file_path': file_path,
+            'camera_label': pkl_path.stem,
+        }
+        for key, value in intr.items():
+            if key == 'frames':
+                continue
+            frame[key] = value
+        frames.append(frame)
+
+    return {'frames': frames}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Run HLOC feature matching and COLMAP reconstruction using camera intrinsics from a transforms.json or calibration .pkl.',
@@ -569,7 +670,7 @@ def parse_args() -> argparse.Namespace:
             '--output_transforms outputs/transforms/goprotest/transforms_predicted.json\n\n'
             '  python scripts/preprocess/predict_poses.py '
             '--images_dir data/ballet/images '
-            '--calibration_pkl output/calibration_data.pkl '
+            '--calibration_path output/calibration_data.pkl '
             '--output_transforms outputs/transforms/ballet/transforms.json '
             '--output_calibration outputs/transforms/ballet/calibration_refined.pkl'
         ),
@@ -594,9 +695,14 @@ def parse_args() -> argparse.Namespace:
         help='Path to transforms.json containing camera_model and intrinsics (fl_x/fl_y/cx/cy and distortion params).',
     )
     input_group.add_argument(
+        '--calibration_path',
         '--calibration_pkl',
+        dest='calibration_path',
         type=Path,
-        help='Path to calibration .pkl (camera_matrix + distortion_coefficients) to use as intrinsics source.',
+        help=(
+            'Path to calibration source: a single .pkl file, or a directory containing '
+            'per-image .pkl files (camera_matrix + distortion_coefficients).'
+        ),
     )
 
     parser.add_argument(
@@ -604,7 +710,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         choices=['PINHOLE', 'OPENCV', 'OPENCV_FISHEYE'],
-        help='Camera model override when using --calibration_pkl. Inferred from distortion count if omitted.',
+        help='Camera model override when using --calibration_path. Inferred from distortion count if omitted.',
     )
 
     parser.add_argument(
@@ -682,8 +788,9 @@ def main() -> None:
         with args.transforms_json.open('r', encoding='utf-8') as handle:
             transforms = json.load(handle)
     else:
-        transforms = load_transforms_from_pkl(
-            args.calibration_pkl,
+        transforms = load_transforms_from_calibration_path(
+            args.calibration_path,
+            images_dir=images_dir,
             camera_model=args.camera_model,
         )
 
