@@ -109,6 +109,25 @@ def _extract_tem_label_from_image_name(image_name: str) -> str | None:
     return matches[-1]
 
 
+def _infer_tem_label_from_frame(frame: dict, basename: str, camera_label: str | None) -> str | None:
+    """Infer temporal label from a frame record with camera-aware fallback.
+
+    If a frame has no explicit temporal field and its basename stem equals the
+    camera label (e.g. ``undistorted_0002.webp`` with camera
+    ``undistorted_0002``), treat it as a single-frame capture and use
+    ``0001`` so all cameras share the same temporal label.
+    """
+    for tkey in ("tem_label", "temporal_label", "frame_label", "time_label", "frame_id"):
+        if frame.get(tkey) is not None:
+            return str(frame[tkey])
+
+    stem = osp.splitext(str(basename))[0]
+    if camera_label is not None and stem == str(camera_label):
+        return "0001"
+
+    return _extract_tem_label_from_image_name(stem)
+
+
 def _cross_platform_basename(file_path: str) -> str:
     """Return the basename of a path that may use Windows or POSIX separators."""
     return str(file_path).replace("\\", "/").split("/")[-1]
@@ -141,16 +160,7 @@ def _build_image_to_cam_tem_map(camera_path: str) -> tuple[
             continue
         basename = _cross_platform_basename(str(file_path))
         stem_key = osp.splitext(basename)[0]
-        # Check explicit temporal fields only; do NOT fall back to osp.basename(file_path)
-        # because Windows-style paths on Linux produce broken stems like
-        # "images\\0001_0001.mp4.thumb" rather than a clean temporal token.
-        tem = None
-        for _tkey in ("tem_label", "temporal_label", "frame_label", "time_label", "frame_id"):
-            if frame.get(_tkey) is not None:
-                tem = str(frame[_tkey])
-                break
-        if tem is None:
-            tem = _extract_tem_label_from_image_name(basename)
+        tem = _infer_tem_label_from_frame(frame, basename=basename, camera_label=str(cam))
         if tem is None:
             continue
         exact[basename] = (str(cam), str(tem))
@@ -384,17 +394,13 @@ def triangulate_skeleton(
             tfs = json.load(f)
         for frame in tfs.get("frames", []):
             cam_label = frame.get("camera_label")
-            tem_label = None
-            for _tkey in ("tem_label", "temporal_label", "frame_label", "time_label", "frame_id"):
-                if frame.get(_tkey) is not None:
-                    tem_label = str(frame[_tkey])
-                    break
-            if tem_label is None:
-                _fp = frame.get("file_path", "")
-                if _fp:
-                    tem_label = _extract_tem_label_from_image_name(
-                        _cross_platform_basename(str(_fp))
-                    )
+            _fp = frame.get("file_path", "")
+            basename = _cross_platform_basename(str(_fp)) if _fp else ""
+            tem_label = _infer_tem_label_from_frame(
+                frame,
+                basename=basename,
+                camera_label=str(cam_label) if cam_label is not None else None,
+            )
             if cam_label is None or tem_label is None:
                 continue
 
