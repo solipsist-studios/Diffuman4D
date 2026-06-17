@@ -511,8 +511,8 @@ def load_transforms_from_pkl(
 ) -> dict:
     """Load a calibration .pkl and return a transforms dict compatible with predict_poses.
 
-    w/h are included only when image_size is present in the pkl; otherwise they
-    are omitted and must be filled in by the caller (e.g. from images_dir).
+    w/h are first taken from the supplied arguments if present; otherwise they are loaded from the pkl if present.
+    If neither is available, they are inferred from the first image under images_dir.
     """
     if not pkl_path.exists() or not pkl_path.is_file():
         raise FileNotFoundError(f'Calibration file does not exist: {pkl_path}')
