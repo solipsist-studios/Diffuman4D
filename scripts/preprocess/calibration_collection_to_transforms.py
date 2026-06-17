@@ -21,16 +21,28 @@ DEFAULT_CANDIDATES = (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a transforms.json from a directory of per-camera calibration folders. "
-            "Each exported frame receives its own camera intrinsics; global intrinsics can "
-            "also be written as the first camera or the mean across cameras."
+            "Build a transforms.json from calibration pickles. "
+            "Supports either per-camera subdirectories or a flat collection of .pkl files "
+            "directly under --calibration_root."
         )
     )
     parser.add_argument(
         "--calibration_root",
         type=Path,
         required=True,
-        help="Root directory containing one subdirectory per camera.",
+        help=(
+            "Root directory containing either one subdirectory per camera, "
+            "or a flat collection of .pkl calibration files."
+        ),
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to an existing transforms JSON used as a base. "
+            "Computed calibration values always override conflicting entries."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -78,10 +90,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--global_intrinsics",
         type=str,
-        default="mean",
-        choices=["mean", "first", "none"],
+        default="input",
+        choices=["input", "mean", "first", "none"],
         help=(
             "How to populate top-level intrinsics for tools that expect a single camera model. "
+            "'input' keeps existing values from --input when present (fallbacks to 'mean'), "
             "'mean' averages across cameras, 'first' copies the first camera, 'none' omits them."
         ),
     )
@@ -173,15 +186,18 @@ def collect_camera_calibrations(
     height: int | None,
     camera_model: str | None,
     strict: bool,
-) -> list[dict]:
+) -> list[tuple[str, dict, bool]]:
     if not calibration_root.exists() or not calibration_root.is_dir():
         raise FileNotFoundError(f"Calibration root does not exist or is not a directory: {calibration_root}")
 
     camera_dirs = sorted(path for path in calibration_root.iterdir() if path.is_dir())
-    if not camera_dirs:
-        raise ValueError(f"No camera subdirectories found under {calibration_root}")
+    flat_pkls = sorted(path for path in calibration_root.iterdir() if path.is_file() and path.suffix.lower() == ".pkl")
+    if not camera_dirs and not flat_pkls:
+        raise ValueError(
+            f"No camera subdirectories or .pkl files found under {calibration_root}"
+        )
 
-    camera_entries = []
+    calibrations: list[tuple[str, dict, bool]] = []
     skipped = []
     for camera_dir in camera_dirs:
         calibration_path = resolve_calibration_path(camera_dir, candidates)
@@ -200,15 +216,21 @@ def collect_camera_calibrations(
             height=height,
             camera_model=camera_model,
         )
-        camera_entries.append(
-            {
-                "camera_dir": camera_dir,
-                "calibration_path": calibration_path,
-                "transforms": transforms,
-            }
-        )
+        calibrations.append((camera_dir.name, transforms, True))
 
-    if not camera_entries:
+    # Also support a flat collection where calibration files live directly
+    # in calibration_root (same style as calibration_pkl_to_json.py batch mode).
+    for calibration_path in flat_pkls:
+        calibration_data = load_calibration(calibration_path)
+        transforms = build_transforms(
+            data=calibration_data,
+            width=width,
+            height=height,
+            camera_model=camera_model,
+        )
+        calibrations.append((calibration_path.stem, transforms, False))
+
+    if not calibrations:
         raise ValueError(
             f"No usable calibration pickles found under {calibration_root}. "
             f"Tried: {', '.join(candidates)}"
@@ -217,27 +239,26 @@ def collect_camera_calibrations(
     if skipped:
         print(f"Skipped {len(skipped)} camera directories without a matching calibration pickle: {', '.join(skipped)}")
 
-    return camera_entries
+    return calibrations
 
 
 def choose_label(
-    camera_dir_name: str,
+    label_source: str,
     index: int,
     reindex_labels: bool,
     label_format: str,
     index_mapping: dict[str, int],
 ) -> str:
     if reindex_labels:
-        label_number = index_mapping.get(camera_dir_name, index)
+        label_number = index_mapping.get(label_source, index)
         return label_format.format(label_number)
-    return camera_dir_name
+    return label_source
 
 
-def populate_global_intrinsics(camera_entries: list[dict], strategy: str) -> dict:
+def populate_global_intrinsics(source_transforms: list[dict], strategy: str) -> dict:
     if strategy == "none":
         return {"frames": []}
 
-    source_transforms = [entry["transforms"] for entry in camera_entries]
     camera_models = {transforms["camera_model"] for transforms in source_transforms}
     if len(camera_models) != 1:
         raise ValueError(
@@ -278,12 +299,92 @@ def populate_global_intrinsics(camera_entries: list[dict], strategy: str) -> dic
     return averaged
 
 
+DISTORTION_KEYS_BY_MODEL: dict[str, set[str]] = {
+    "OPENCV_FISHEYE": {"k1", "k2", "k3", "k4"},
+    "OPENCV": {"k1", "k2", "p1", "p2"},
+    "PINHOLE": set(),
+}
+ALL_DISTORTION_KEYS: set[str] = set().union(*DISTORTION_KEYS_BY_MODEL.values())
+
+
+def strip_extraneous_distortion(obj: dict) -> dict:
+    model = obj.get("camera_model")
+    allowed = DISTORTION_KEYS_BY_MODEL.get(model, ALL_DISTORTION_KEYS)
+    for key in ALL_DISTORTION_KEYS - allowed:
+        obj.pop(key, None)
+    return obj
+
+
+def infer_intrinsic_keys(source_transforms: list[dict]) -> set[str]:
+    keys: set[str] = set()
+    for transforms in source_transforms:
+        if not isinstance(transforms, dict):
+            continue
+        keys.update(key for key in transforms.keys() if key != "frames")
+    return keys
+
+
+def has_input_intrinsics(payload: dict, intrinsic_keys: set[str]) -> bool:
+    return any(key in payload for key in intrinsic_keys)
+
+
+def load_base_output(input_path: Path | None) -> dict:
+    if input_path is None:
+        return {}
+    if not input_path.exists() or not input_path.is_file():
+        raise FileNotFoundError(f"Input JSON does not exist: {input_path}")
+
+    with input_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Input JSON must be an object: {input_path}")
+    return payload
+
+
+def merge_frames(base_frames: list, computed_frames: list[dict]) -> list[dict]:
+    if not isinstance(base_frames, list):
+        base_frames = []
+
+    base_by_label: dict[str, dict] = {}
+    base_by_path: dict[str, dict] = {}
+    for frame in base_frames:
+        if not isinstance(frame, dict):
+            continue
+        camera_label = frame.get("camera_label")
+        file_path = frame.get("file_path")
+        if isinstance(camera_label, str) and camera_label not in base_by_label:
+            base_by_label[camera_label] = frame
+        if isinstance(file_path, str) and file_path not in base_by_path:
+            base_by_path[file_path] = frame
+
+    merged_frames: list[dict] = []
+    for index, frame in enumerate(computed_frames):
+        base_frame = None
+        camera_label = frame.get("camera_label")
+        file_path = frame.get("file_path")
+        if isinstance(camera_label, str):
+            base_frame = base_by_label.get(camera_label)
+        if base_frame is None and isinstance(file_path, str):
+            base_frame = base_by_path.get(file_path)
+        if base_frame is None and index < len(base_frames) and isinstance(base_frames[index], dict):
+            # Positional fallback preserves metadata even when labels/paths are regenerated.
+            base_frame = base_frames[index]
+
+        merged = dict(base_frame) if isinstance(base_frame, dict) else {}
+        merged.update(frame)
+        strip_extraneous_distortion(merged)
+        merged_frames.append(merged)
+
+    return merged_frames
+
+
 def main() -> None:
     args = parse_args()
     candidates = tuple(args.candidate or DEFAULT_CANDIDATES)
+    base_output = load_base_output(args.input)
     index_file = resolve_index_file(args.calibration_root, args.index_file)
     index_mapping = load_index_mapping(index_file)
-    camera_entries = collect_camera_calibrations(
+    calibrations = collect_camera_calibrations(
         calibration_root=args.calibration_root,
         candidates=candidates,
         width=args.width,
@@ -291,23 +392,41 @@ def main() -> None:
         camera_model=args.camera_model,
         strict=args.strict,
     )
+    source_transforms = [transforms for _, transforms, _ in calibrations]
     if args.reindex_labels and index_mapping:
         missing_index_entries = [
-            entry["camera_dir"].name for entry in camera_entries if entry["camera_dir"].name not in index_mapping
+            label_source
+            for label_source, _, from_directory in calibrations
+            if from_directory and label_source not in index_mapping
         ]
         if missing_index_entries:
             raise ValueError(
                 "The following calibration directories were missing from the index mapping: "
                 + ", ".join(missing_index_entries)
             )
-        camera_entries = sorted(camera_entries, key=lambda entry: index_mapping[entry["camera_dir"].name])
+        calibrations = sorted(
+            calibrations,
+            key=lambda item: index_mapping.get(item[0], 10**9)
+        )
+        source_transforms = [transforms for _, transforms, _ in calibrations]
 
-    output = populate_global_intrinsics(camera_entries, args.global_intrinsics)
-    output["frames"] = []
+    intrinsic_keys = infer_intrinsic_keys(source_transforms)
+    intrinsics_strategy = args.global_intrinsics
+    keep_input_intrinsics = False
+    if intrinsics_strategy == "input":
+        if has_input_intrinsics(base_output, intrinsic_keys):
+            keep_input_intrinsics = True
+            computed_output = {"frames": []}
+        else:
+            intrinsics_strategy = "mean"
+            computed_output = populate_global_intrinsics(source_transforms, intrinsics_strategy)
+    else:
+        computed_output = populate_global_intrinsics(source_transforms, intrinsics_strategy)
+    computed_output["frames"] = []
 
-    for index, entry in enumerate(camera_entries):
+    for index, (label_source, transforms, _) in enumerate(calibrations):
         camera_label = choose_label(
-            camera_dir_name=entry["camera_dir"].name,
+            label_source=label_source,
             index=index,
             reindex_labels=args.reindex_labels,
             label_format=args.label_format,
@@ -315,19 +434,36 @@ def main() -> None:
         )
         frame = {
             "camera_label": camera_label,
-            "file_path": args.file_path_template.format(camera_label=camera_label),
+            "file_path": args.file_path_template.format(camera_label, camera_label=camera_label),
         }
-        for key, value in entry["transforms"].items():
+        for key, value in transforms.items():
             if key == "frames":
                 continue
             frame[key] = value
-        output["frames"].append(frame)
+        computed_output["frames"].append(frame)
+
+    output = dict(base_output)
+    base_frames = output.get("frames", [])
+    output["frames"] = merge_frames(base_frames, computed_output["frames"])
+
+    if keep_input_intrinsics:
+        strip_extraneous_distortion(output)
+    else:
+        for key in intrinsic_keys:
+            output.pop(key, None)
+        for key, value in computed_output.items():
+            if key == "frames":
+                continue
+            output[key] = value
+        strip_extraneous_distortion(output)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as handle:
         json.dump(output, handle, indent=args.indent)
 
     print(f"Wrote {len(output['frames'])} camera entries to {args.output}")
+    if args.input is not None:
+        print(f"Used base JSON from: {args.input}")
     print(f"Candidates tried per camera: {', '.join(candidates)}")
     if args.reindex_labels:
         if index_file is not None:
@@ -336,6 +472,10 @@ def main() -> None:
             print("Camera labels assigned by sorted directory order (no index file found).")
     if args.global_intrinsics == "none":
         print("Top-level intrinsics omitted.")
+    elif args.global_intrinsics == "input" and keep_input_intrinsics:
+        print("Top-level intrinsics preserved from input JSON.")
+    elif args.global_intrinsics == "input":
+        print("Top-level intrinsics strategy: input (fallback to mean because input had no intrinsics).")
     else:
         print(f"Top-level intrinsics strategy: {args.global_intrinsics}")
 

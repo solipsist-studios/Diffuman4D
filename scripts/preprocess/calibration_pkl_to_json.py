@@ -9,15 +9,21 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert an OpenCV calibration .pkl file into a transforms.json "
-            "with global intrinsics for pose prediction."
+            "Convert calibration .pkl file(s) into transforms-style JSON. "
+            "If --calibration_path is a directory, all .pkl files are combined "
+            "into one output JSON."
         )
     )
     parser.add_argument(
+        "--calibration_path",
         "--calibration_pkl",
+        dest="calibration_path",
         type=Path,
         required=True,
-        help="Path to calibration .pkl containing camera_matrix and distortion_coefficients.",
+        help=(
+            "Path to calibration .pkl, or a directory containing .pkl files with "
+            "camera_matrix and distortion_coefficients."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -53,6 +59,24 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="JSON indentation level.",
     )
+    parser.add_argument(
+        "--file_path_dir",
+        type=str,
+        default="images",
+        help=(
+            "Directory prefix to use in each frame file_path. "
+            'Example: "images" -> images/<camera_label>.jpg'
+        ),
+    )
+    parser.add_argument(
+        "--image_ext",
+        type=str,
+        default=".jpg",
+        help=(
+            "Image extension for generated frame file_path values. "
+            "Accepts values like .jpg, jpg, .png, webp."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -68,6 +92,22 @@ def load_calibration(path: Path) -> dict:
             "Calibration file is missing required keys: camera_matrix and/or distortion_coefficients."
         )
     return data
+
+
+def collect_calibration_files(calibration_path: Path) -> list[Path]:
+    if not calibration_path.exists():
+        raise FileNotFoundError(f"calibration_path does not exist: {calibration_path}")
+
+    if calibration_path.is_file():
+        return [calibration_path]
+
+    if not calibration_path.is_dir():
+        raise ValueError(f"calibration_path must be a file or directory: {calibration_path}")
+
+    files = sorted(p for p in calibration_path.iterdir() if p.is_file() and p.suffix.lower() == ".pkl")
+    if not files:
+        raise FileNotFoundError(f"No .pkl calibration files found in directory: {calibration_path}")
+    return files
 
 SUPPORTED_MODELS = {'OPENCV', 'OPENCV_FISHEYE', 'PINHOLE'}
 
@@ -137,25 +177,84 @@ def build_transforms(
     return transforms
 
 
+def build_frame_from_calibration(
+    label: str,
+    transforms: dict,
+    file_path_dir: str,
+    image_ext: str,
+) -> dict:
+    # Per-frame pose is unknown from calibration alone; use identity as placeholder.
+    identity = np.eye(4, dtype=np.float64).tolist()
+    prefix = str(file_path_dir).replace("\\", "/").strip("/")
+    ext = str(image_ext).strip()
+    if not ext:
+        ext = ".jpg"
+    if not ext.startswith("."):
+        ext = f".{ext}"
+
+    if prefix:
+        file_path = f"{prefix}/{label}{ext}"
+    else:
+        file_path = f"{label}{ext}"
+
+    frame = {
+        "file_path": file_path,
+        "camera_label": label,
+        "transform_matrix": identity,
+    }
+
+    for key, value in transforms.items():
+        if key != "frames":
+            frame[key] = value
+
+    return frame
+
+
 def main() -> None:
     args = parse_args()
-    data = load_calibration(args.calibration_pkl)
-    transforms = build_transforms(
-        data=data,
-        width=args.width,
-        height=args.height,
-        camera_model=args.camera_model,
-    )
+    calibration_files = collect_calibration_files(args.calibration_path)
+
+    frames: list[dict] = []
+    first_transforms: dict | None = None
+    for path in calibration_files:
+        data = load_calibration(path)
+        transforms = build_transforms(
+            data=data,
+            width=args.width,
+            height=args.height,
+            camera_model=args.camera_model,
+        )
+        if first_transforms is None:
+            first_transforms = transforms
+        frames.append(
+            build_frame_from_calibration(
+                path.stem,
+                transforms,
+                file_path_dir=args.file_path_dir,
+                image_ext=args.image_ext,
+            )
+        )
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
+
+    payload = {"frames": frames}
+    if first_transforms is not None and len(frames) == 1 and args.calibration_path.is_file():
+        for key, value in first_transforms.items():
+            if key != "frames":
+                payload[key] = value
+
     with args.output.open("w", encoding="utf-8") as f:
-        json.dump(transforms, f, indent=args.indent)
+        json.dump(payload, f, indent=args.indent)
 
     print(f"Wrote transforms JSON to: {args.output}")
-    print(f"camera_model={transforms['camera_model']}, w={transforms['w']}, h={transforms['h']}")
-    print(
-        f"fl_x={transforms['fl_x']:.6f}, fl_y={transforms['fl_y']:.6f}, "
-        f"cx={transforms['cx']:.6f}, cy={transforms['cy']:.6f}"
-    )
+    if first_transforms is not None and len(frames) == 1 and args.calibration_path.is_file():
+        print(f"camera_model={first_transforms['camera_model']}, w={first_transforms['w']}, h={first_transforms['h']}")
+        print(
+            f"fl_x={first_transforms['fl_x']:.6f}, fl_y={first_transforms['fl_y']:.6f}, "
+            f"cx={first_transforms['cx']:.6f}, cy={first_transforms['cy']:.6f}"
+        )
+    else:
+        print(f"Converted {len(frames)} calibration file(s) from: {args.calibration_path}")
 
 
 if __name__ == "__main__":
