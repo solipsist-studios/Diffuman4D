@@ -178,7 +178,6 @@ def predict_keypoints(
     out_kp2d_dir: str,
     fmasks_dir: str | None = None,
     max_subjects: int | None = None,
-    max_bone_frac: float = 0.35,
     max_bone_sigma: float = 0.0,
     max_bilateral_ratio: float = 3.5,
     sapiens_ckpt_path: str = f"{ckpt_root}/pose/sapiens2_1b_pose.safetensors",
@@ -281,7 +280,6 @@ def predict_keypoints(
     if max_subjects is not None:
         cmd_parts.extend(["--max-subjects", str(max_subjects)])
 
-    cmd_parts.extend(["--max-bone-frac", str(max_bone_frac)])
     cmd_parts.extend(["--max-bone-sigma", str(max_bone_sigma)])
     cmd_parts.extend(["--max-bilateral-ratio", str(max_bilateral_ratio)])
 
