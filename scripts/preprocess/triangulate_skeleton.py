@@ -384,6 +384,39 @@ def triangulate_skeleton(
             tem_labels = sorted(os.listdir(osp.join(kp2d_dir, spa_labels[0])))
             tem_labels = [label.split(".")[0] for label in tem_labels]
 
+    # Auto-detect intrinsics scale factor if not specified
+    if intri_scale is None:
+        kp2d_w = None
+        if kp2d_mode == "combined_json" and osp.isfile(combined_json_path):
+            try:
+                with open(combined_json_path, "r") as f:
+                    payload = json.load(f)
+                kp2d_img_size = payload.get("image_size")
+                if kp2d_img_size and len(kp2d_img_size) == 2:
+                    kp2d_w = kp2d_img_size[0]
+            except Exception as e:
+                print(f"Warning: failed to read image size from keypoint JSON: {e}")
+
+        cam_w = None
+        if camera_path.endswith(".json") and osp.isfile(camera_path):
+            try:
+                with open(camera_path, "r") as f:
+                    tfs = json.load(f)
+                cam_w = tfs.get("w") or tfs.get("width")
+                if cam_w is None:
+                    frames_tfs = tfs.get("frames", [])
+                    if frames_tfs:
+                        cam_w = frames_tfs[0].get("w") or frames_tfs[0].get("width")
+            except Exception as e:
+                print(f"Warning: failed to read camera width: {e}")
+
+        if kp2d_w is not None and cam_w is not None:
+            auto_scale = float(kp2d_w) / float(cam_w)
+            if abs(auto_scale - 1.0) > 1e-4:
+                intri_scale = auto_scale
+                print(f"Auto-detected intrinsics scale factor: {intri_scale:.6f} "
+                      f"(keypoint width {kp2d_w} / camera width {cam_w})")
+
     # Load static cameras as baseline. For Nerfstudio-style JSON, optionally
     # override with per-frame intrinsics/extrinsics when available.
     cams = parse_cameras(camera_path, coord_system="opencv", normalize_scene=False)
