@@ -3,6 +3,7 @@ import os
 import fire
 import torch
 import threading
+import numpy as np
 from PIL import Image
 from glob import glob
 from torchvision import transforms
@@ -54,7 +55,69 @@ def extract_object(images, model, sema):
     return fmasks
 
 
-def inference_batch(image_paths, fmask_paths, image_alpha_paths, model, sema, rotate_clockwise, skip_exists):
+def _keep_top_subject_bboxes(fmask: Image.Image, max_subjects: int) -> Image.Image:
+    if max_subjects <= 0:
+        return Image.new("L", fmask.size, 0)
+
+    mask = np.asarray(fmask, dtype=np.uint8)
+    fg = mask > 0
+    if not fg.any():
+        return fmask
+
+    visited = np.zeros_like(fg, dtype=bool)
+    components = []
+    height, width = fg.shape
+
+    for y in range(height):
+        for x in range(width):
+            if not fg[y, x] or visited[y, x]:
+                continue
+
+            stack = [(y, x)]
+            visited[y, x] = True
+            size = 0
+            conf_sum = 0.0
+            min_y = max_y = y
+            min_x = max_x = x
+
+            while stack:
+                cy, cx = stack.pop()
+                size += 1
+                conf_sum += float(mask[cy, cx])
+                min_y = min(min_y, cy)
+                max_y = max(max_y, cy)
+                min_x = min(min_x, cx)
+                max_x = max(max_x, cx)
+
+                if cy > 0 and fg[cy - 1, cx] and not visited[cy - 1, cx]:
+                    visited[cy - 1, cx] = True
+                    stack.append((cy - 1, cx))
+                if cy + 1 < height and fg[cy + 1, cx] and not visited[cy + 1, cx]:
+                    visited[cy + 1, cx] = True
+                    stack.append((cy + 1, cx))
+                if cx > 0 and fg[cy, cx - 1] and not visited[cy, cx - 1]:
+                    visited[cy, cx - 1] = True
+                    stack.append((cy, cx - 1))
+                if cx + 1 < width and fg[cy, cx + 1] and not visited[cy, cx + 1]:
+                    visited[cy, cx + 1] = True
+                    stack.append((cy, cx + 1))
+
+            # Rank by total confidence so weak fragments are less likely to win.
+            components.append((conf_sum, size, min_y, max_y, min_x, max_x))
+
+    if not components:
+        return fmask
+
+    components.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    keep = np.zeros_like(mask, dtype=bool)
+    for _, _, min_y, max_y, min_x, max_x in components[:max_subjects]:
+        keep[min_y : max_y + 1, min_x : max_x + 1] = True
+
+    filtered_mask = np.where(keep, mask, 0).astype(np.uint8)
+    return Image.fromarray(filtered_mask, mode="L")
+
+
+def inference_batch(image_paths, fmask_paths, image_alpha_paths, model, sema, rotate_clockwise, skip_exists, max_subjects):
     if skip_exists:
         is_completed = True
         for fmask_path in fmask_paths:
@@ -82,6 +145,8 @@ def inference_batch(image_paths, fmask_paths, image_alpha_paths, model, sema, ro
     fmasks = extract_object(images, model, sema)
 
     for image, fmask, fmask_path, image_alpha_path in zip(images, fmasks, fmask_paths, image_alpha_paths):
+        if max_subjects is not None:
+            fmask = _keep_top_subject_bboxes(fmask, max_subjects)
         if rotate_clockwise != 0:
             fmask = fmask.rotate(rotate_clockwise, expand=True)
         os.makedirs(os.path.dirname(fmask_path), exist_ok=True)
@@ -102,6 +167,7 @@ def remove_background(
     image_ext: str = ".webp",
     mask_ext: str = ".png",
     rotate_clockwise: int = 0,
+    max_subjects: int | None = None,
     batch_size: int = 8,
     num_workers: int = 4,
     skip_exists: bool = False,
@@ -160,6 +226,7 @@ def remove_background(
         semas_batch,
         rotate_clockwise,
         skip_exists,
+        max_subjects,
         action=inference_batch,
         sequential=False,
         num_workers=num_workers * len(gpu_ids),
