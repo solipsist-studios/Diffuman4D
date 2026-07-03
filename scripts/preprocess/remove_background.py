@@ -69,7 +69,7 @@ def _keep_top_subject_bboxes(fmask: Image.Image, max_subjects: int) -> Image.Ima
     if num_labels <= 1:
         return fmask
 
-    conf_sums = np.bincount(labels.ravel(), weights=mask.ravel().astype(np.float64), minlength=num_labels)
+    conf_sums = np.bincount(labels.ravel(), weights=mask.ravel().astype(np.float32), minlength=num_labels)
     components = []
     for label in range(1, num_labels):
         left = stats[label, cv2.CC_STAT_LEFT]
