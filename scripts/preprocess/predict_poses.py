@@ -817,9 +817,12 @@ def load_transforms_from_calibration_path(
 
 def compute_spatial_order(transforms: dict, names: list[str], num_locations: int) -> list[int]:
     """Dynamically determine spatial sequence of camera locations using PCA and angular sorting.
-    
+
     This finds the largest angular gap to handle open arc rig configurations and orders them sequentially.
     """
+    if num_locations <= 1:
+        return list(range(num_locations))
+
     # 1. Map each image name to its transform matrix translation vector
     translation_by_key = {}
     for frame in transforms.get('frames', []):
@@ -1105,23 +1108,37 @@ def main() -> None:
 
     if args.adjacent_matching:
         print('Generating adjacent pairs for the rig to prevent symmetry mismatch...')
-        # Get sorted list of images from images_dir (recursive, relative paths)
-        image_paths = [
-            p for p in sorted(images_dir.rglob('*'))
-            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        # Get sorted list of images from images_dir (recursive, relative paths)
+
+        image_paths = [
+
+            p for p in sorted(images_dir.rglob('*'))
+
+            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+
         ]
-        names = [p.relative_to(images_dir).as_posix() for p in image_paths]
-
+        names = [p.relative_to(images_dir).as_posix() for p in image_paths]
+
+
+
         num_images = len(names)
-        if num_images < 2:
-            raise ValueError(f'Adjacent matching requires at least 2 images, got {num_images}.')
-        if num_images % 2 != 0:
-            raise ValueError(
-                'Adjacent matching requires an even number of images (top/bottom per location), '
-                f'got {num_images}.'
-            )
+        if num_images < 2:
+
+            raise ValueError(f'Adjacent matching requires at least 2 images, got {num_images}.')
+
+        if num_images % 2 != 0:
+
+            raise ValueError(
+
+                'Adjacent matching requires an even number of images (top/bottom per location), '
+
+                f'got {num_images}.'
+
+            )
+
         num_locations = num_images // 2
-        pairs: list[tuple[str, str]] = []
+        pairs: list[tuple[str, str]] = []
+
         # 1. Vertical pairs (within same location)
         for i in range(num_locations):
             idx1 = 2 * i
