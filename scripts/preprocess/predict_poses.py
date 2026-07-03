@@ -9,6 +9,9 @@ import numpy as np
 from hloc import extract_features, match_features, reconstruction, pairs_from_exhaustive
 import pycolmap
 
+
+SUPPORTED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
+
 def load_camera_from_transforms(transforms: dict) -> pycolmap.Camera:
     width = transforms.get('w', transforms.get('width'))
     height = transforms.get('h', transforms.get('height'))
@@ -187,9 +190,8 @@ def _infer_camera_model(model: str | None, dist: np.ndarray) -> str:
 def _infer_image_size(images_dir: Path) -> tuple[int, int]:
     """Return (width, height) of the first readable image found under images_dir."""
     from PIL import Image  # lazy import — only needed when size must be inferred
-    supported = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
     for path in sorted(images_dir.rglob('*')):
-        if path.is_file() and path.suffix.lower() in supported:
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS:
             try:
                 with Image.open(path) as img:
                     return img.width, img.height
@@ -202,6 +204,161 @@ def _infer_image_size(images_dir: Path) -> tuple[int, int]:
 
 def _count_input_images(image_dir: Path) -> int:
     return sum(1 for path in image_dir.rglob('*') if path.is_file())
+
+
+def _resize_dimensions(width: int, height: int, resize_max: int | None) -> tuple[int, int]:
+    if resize_max is None or resize_max <= 0:
+        return int(width), int(height)
+
+    max_dim = max(width, height)
+    if max_dim <= resize_max:
+        return int(width), int(height)
+
+    scale = resize_max / float(max_dim)
+    resized_width = max(1, int(round(width * scale)))
+    resized_height = max(1, int(round(height * scale)))
+    return resized_width, resized_height
+
+
+def _resolution_issue(message: str, strict: bool) -> None:
+    if strict:
+        raise ValueError(message)
+    print(f'WARNING: {message}')
+
+
+def _collect_expected_image_sizes(
+    images_dir: Path,
+    resize_max: int | None,
+) -> tuple[dict[str, tuple[int, int]], set[tuple[int, int]]]:
+    from PIL import Image  # lazy import — only needed for explicit validation
+
+    expected_by_key: dict[str, tuple[int, int]] = {}
+    unique_sizes: set[tuple[int, int]] = set()
+    ambiguous_keys: set[str] = set()
+
+    for path in sorted(images_dir.rglob('*')):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
+            continue
+
+        try:
+            with Image.open(path) as img:
+                expected_size = _resize_dimensions(img.width, img.height, resize_max)
+        except Exception:
+            continue
+
+        unique_sizes.add(expected_size)
+
+        rel_key = _normalized_rel_to_images(images_dir, path)
+        for lookup_key in _path_lookup_keys(rel_key):
+            previous = expected_by_key.get(lookup_key)
+            if previous is not None and previous != expected_size:
+                ambiguous_keys.add(lookup_key)
+                continue
+            expected_by_key[lookup_key] = expected_size
+
+    for key in ambiguous_keys:
+        expected_by_key.pop(key, None)
+
+    if not expected_by_key:
+        raise FileNotFoundError(
+            f'No readable images found under {images_dir} to validate calibration resolution.'
+        )
+
+    return expected_by_key, unique_sizes
+
+
+def _validate_calibration_resolution(
+    transforms: dict,
+    images_dir: Path,
+    resize_max: int | None,
+    strict: bool,
+) -> None:
+    expected_by_key, unique_sizes = _collect_expected_image_sizes(images_dir, resize_max)
+    use_per_frame_intrinsics = _can_load_per_frame_intrinsics(transforms)
+
+    if use_per_frame_intrinsics:
+        mismatches: list[tuple[str, tuple[int, int], tuple[int, int]]] = []
+        missing_resolution_count = 0
+        unresolved_file_path_count = 0
+
+        for frame in transforms.get('frames', []):
+            frame_w = frame.get('w', frame.get('width'))
+            frame_h = frame.get('h', frame.get('height'))
+            if frame_w is None or frame_h is None:
+                missing_resolution_count += 1
+                continue
+
+            frame_file_path = frame.get('file_path')
+            if not isinstance(frame_file_path, str) or not frame_file_path:
+                unresolved_file_path_count += 1
+                continue
+
+            expected_size = None
+            for lookup_key in _path_lookup_keys(frame_file_path):
+                expected_size = expected_by_key.get(lookup_key)
+                if expected_size is not None:
+                    break
+
+            if expected_size is None:
+                unresolved_file_path_count += 1
+                continue
+
+            actual_size = (int(frame_w), int(frame_h))
+            if actual_size != expected_size:
+                mismatches.append((frame_file_path, actual_size, expected_size))
+
+        if missing_resolution_count > 0:
+            _resolution_issue(
+                'Some per-frame calibration entries are missing w/h fields '
+                f'({missing_resolution_count} frame(s)); resolution checks were skipped for those entries.',
+                strict,
+            )
+
+        if unresolved_file_path_count > 0:
+            _resolution_issue(
+                'Some per-frame calibration entries could not be mapped to images under images_dir '
+                f'({unresolved_file_path_count} frame(s)); resolution checks were skipped for those entries.',
+                strict,
+            )
+
+        if mismatches:
+            preview = ', '.join(
+                f"{file_path}: calib={actual[0]}x{actual[1]}, expected={expected[0]}x{expected[1]}"
+                for file_path, actual, expected in mismatches[:5]
+            )
+            _resolution_issue(
+                'Per-frame calibration resolution does not match image resolution '
+                f'after resize_max processing (mismatched frames: {len(mismatches)}). '
+                f'Examples: {preview}',
+                strict,
+            )
+        return
+
+    calib_w = transforms.get('w', transforms.get('width'))
+    calib_h = transforms.get('h', transforms.get('height'))
+    if calib_w is None or calib_h is None:
+        _resolution_issue(
+            'Global calibration does not include w/h fields; unable to validate resolution match.',
+            strict,
+        )
+        return
+
+    if len(unique_sizes) != 1:
+        samples = ', '.join(f'{w}x{h}' for w, h in sorted(unique_sizes)[:5])
+        _resolution_issue(
+            'Input images do not have a single effective resolution after resize_max processing; '
+            f'found {len(unique_sizes)} distinct size(s). Sample sizes: {samples}',
+            strict,
+        )
+        return
+
+    expected_w, expected_h = next(iter(unique_sizes))
+    if (int(calib_w), int(calib_h)) != (expected_w, expected_h):
+        _resolution_issue(
+            'Global calibration resolution does not match effective image resolution after resize_max processing: '
+            f'calibration={int(calib_w)}x{int(calib_h)}, expected={expected_w}x{expected_h}.',
+            strict,
+        )
 
 
 def _camera_name_score(name: str) -> int:
@@ -747,6 +904,30 @@ def parse_args() -> argparse.Namespace:
         choices=['auto', 'directory', 'filename'],
         help='How to derive the exported camera name from nested COLMAP image paths.',
     )
+    parser.add_argument(
+        '--feature_type',
+        type=str,
+        default='superpoint',
+        choices=['superpoint', 'aliked'],
+        help='Feature extraction method: superpoint or aliked.',
+    )
+    parser.add_argument(
+        '--resize_max',
+        type=int,
+        default=4096,
+        help='Maximum dimension to resize images to before feature extraction. Defaults to 4096. Set to 0 or negative to disable resizing.',
+    )
+    parser.add_argument(
+        '--strict',
+        action='store_true',
+        help='Treat calibration/image resolution mismatches as errors instead of warnings.',
+    )
+    parser.add_argument(
+        '--max_keypoints',
+        type=int,
+        default=8192,
+        help='Maximum number of keypoints to extract per image. Defaults to 8192.',
+    )
 
     return parser.parse_args()
 
@@ -766,12 +947,36 @@ def main() -> None:
     sfm_pairs = outputs_dir / 'pairs-exhaustive.txt'
     sfm_dir = outputs_dir / 'sfm_reconstruction'
 
-    feature_conf = extract_features.confs['superpoint_aachen']
-    matcher_conf = match_features.confs['superpoint+lightglue']
+    resize_val = args.resize_max if args.resize_max > 0 else None
 
-    # feature_conf = extract_features.confs['aliked-n16']
-    # feature_conf['model']['max_num_keypoints'] = 8192 
-    # matcher_conf = match_features.confs['aliked+lightglue']
+    if args.feature_type == 'superpoint':
+        feature_conf = {
+            'model': {
+                'name': 'superpoint',
+                'nms_radius': 3,
+                'max_keypoints': args.max_keypoints,
+            },
+            'preprocessing': {
+                'grayscale': True,
+                'resize_max': resize_val,
+            },
+            'output': f"feats-superpoint-n{args.max_keypoints}-r{args.resize_max}",
+        }
+        matcher_conf = match_features.confs['superpoint+lightglue']
+    elif args.feature_type == 'aliked':
+        feature_conf = {
+            'model': {
+                'name': 'aliked',
+                'model_name': 'aliked-n16',
+                'max_num_keypoints': args.max_keypoints,
+            },
+            'preprocessing': {
+                'grayscale': False,
+                'resize_max': resize_val,
+            },
+            'output': f"feats-aliked-n{args.max_keypoints}-r{args.resize_max}",
+        }
+        matcher_conf = match_features.confs['aliked+lightglue']
 
     print('Extracting features...')
     feature_path = extract_features.main(feature_conf, images_dir, outputs_dir)
@@ -793,6 +998,13 @@ def main() -> None:
             images_dir=images_dir,
             camera_model=args.camera_model,
         )
+
+    _validate_calibration_resolution(
+        transforms=transforms,
+        images_dir=images_dir,
+        resize_max=resize_val,
+        strict=args.strict,
+    )
 
     use_per_frame_intrinsics = _can_load_per_frame_intrinsics(transforms)
     per_frame_model = None
