@@ -234,6 +234,7 @@ def _collect_expected_image_sizes(
 
     expected_by_key: dict[str, tuple[int, int]] = {}
     unique_sizes: set[tuple[int, int]] = set()
+    ambiguous_keys: set[str] = set()
 
     for path in sorted(images_dir.rglob('*')):
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS:
@@ -249,8 +250,15 @@ def _collect_expected_image_sizes(
 
         rel_key = _normalized_rel_to_images(images_dir, path)
         for lookup_key in _path_lookup_keys(rel_key):
-            expected_by_key.setdefault(lookup_key, expected_size)
+            previous = expected_by_key.get(lookup_key)
+            if previous is not None and previous != expected_size:
+                ambiguous_keys.add(lookup_key)
+                continue
+            expected_by_key[lookup_key] = expected_size
 
+    for key in ambiguous_keys:
+        expected_by_key.pop(key, None)
+
     if not expected_by_key:
         raise FileNotFoundError(
             f'No readable images found under {images_dir} to validate calibration resolution.'
