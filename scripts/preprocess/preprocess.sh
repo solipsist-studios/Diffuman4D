@@ -48,7 +48,10 @@ if [ -z "$DATADIR" ]; then
   exit 1
 fi
 
-# convert relative path to absolute path
+if [ ! -d "$DATADIR" ]; then
+  echo ">> Error: --data_dir does not exist: $DATADIR" >&2
+  exit 1
+fi
 DATADIR="$(cd "$DATADIR" && pwd)"
 
 echo ">> Data directory: $DATADIR"
