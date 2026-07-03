@@ -815,6 +815,95 @@ def load_transforms_from_calibration_path(
     return {'frames': frames}
 
 
+def compute_spatial_order(transforms: dict, names: list[str], num_locations: int) -> list[int]:
+    """Dynamically determine spatial sequence of camera locations using PCA and angular sorting.
+
+    This finds the largest angular gap to handle open arc rig configurations and orders them sequentially.
+    """
+    if num_locations <= 1:
+        return list(range(num_locations))
+
+    # 1. Map each image name to its transform matrix translation vector
+    translation_by_key = {}
+    for frame in transforms.get('frames', []):
+        file_path = frame.get('file_path')
+        matrix = frame.get('transform_matrix')
+        if not file_path or matrix is None:
+            continue
+        c2w = np.array(matrix)
+        if c2w.shape == (4, 4):
+            translation = c2w[:3, 3]
+            for key in _path_lookup_keys(file_path):
+                translation_by_key[key] = translation
+
+    # 2. Get translation for each location by averaging its camera translations
+    loc_centers = []
+    for i in range(num_locations):
+        idx1 = 2 * i
+        idx2 = 2 * i + 1
+        t1, t2 = None, None
+        if idx1 < len(names):
+            for key in _path_lookup_keys(names[idx1]):
+                if key in translation_by_key:
+                    t1 = translation_by_key[key]
+                    break
+        if idx2 < len(names):
+            for key in _path_lookup_keys(names[idx2]):
+                if key in translation_by_key:
+                    t2 = translation_by_key[key]
+                    break
+        
+        if t1 is not None and t2 is not None:
+            center = (t1 + t2) / 2.0
+        elif t1 is not None:
+            center = t1
+        elif t2 is not None:
+            center = t2
+        else:
+            center = None
+        loc_centers.append(center)
+
+    # If we couldn't resolve translations for all locations, return default numeric order
+    if any(c is None for c in loc_centers):
+        print("WARNING: Could not resolve initial camera translations for all locations. "
+              "Falling back to numeric camera ordering.")
+        return list(range(num_locations))
+
+    # 3. Project 3D centers to 2D plane using PCA
+    pts = np.array(loc_centers)
+    centroid = pts.mean(axis=0)
+    centered_pts = pts - centroid
+    
+    # Run SVD
+    _, _, Vt = np.linalg.svd(centered_pts)
+    pts_2d = centered_pts @ Vt[:2].T
+
+    # 4. Compute angles relative to centroid
+    angles = np.arctan2(pts_2d[:, 1], pts_2d[:, 0])
+    
+    # 5. Sort locations by angle
+    sorted_indices = np.argsort(angles)
+    sorted_angles = angles[sorted_indices]
+
+    # 6. Find the largest angular gap
+    gaps = []
+    n = len(sorted_indices)
+    for idx in range(n):
+        diff = sorted_angles[(idx + 1) % n] - sorted_angles[idx]
+        if diff < 0:
+            diff += 2 * np.pi
+        gaps.append(diff)
+        
+    largest_gap_idx = np.argmax(gaps)
+    start_idx = (largest_gap_idx + 1) % n
+    
+    spatial_order = []
+    for offset in range(n):
+        spatial_order.append(int(sorted_indices[(start_idx + offset) % n]))
+        
+    return spatial_order
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Run HLOC feature matching and COLMAP reconstruction using camera intrinsics from a transforms.json or calibration .pkl.',
@@ -928,6 +1017,30 @@ def parse_args() -> argparse.Namespace:
         default=8192,
         help='Maximum number of keypoints to extract per image. Defaults to 8192.',
     )
+    parser.add_argument(
+        '--adjacent_matching',
+        action='store_true',
+        help='Only match adjacent cameras in the rig to prevent false matches from repetitive structures.',
+    )
+    parser.add_argument(
+        '--camera_order',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Optional manual spatial sequence of camera location indices (e.g. 3 4 5 0 1 2) to override dynamic order.',
+    )
+    parser.add_argument(
+        '--filter_min_tri_angle',
+        type=float,
+        default=1.5,
+        help='Minimum triangulation angle in degrees to filter out low-parallax points. Defaults to 1.5.',
+    )
+    parser.add_argument(
+        '--filter_max_reproj_error',
+        type=float,
+        default=4.0,
+        help='Maximum reprojection error in pixels to filter out noisy matches. Defaults to 4.0.',
+    )
 
     return parser.parse_args()
 
@@ -978,15 +1091,6 @@ def main() -> None:
         }
         matcher_conf = match_features.confs['aliked+lightglue']
 
-    print('Extracting features...')
-    feature_path = extract_features.main(feature_conf, images_dir, outputs_dir)
-
-    print('Generating exhaustive pairs for the rig...')
-    pairs_from_exhaustive.main(sfm_pairs, image_list=None, features=feature_path)
-
-    print('Matching features with LightGlue...')
-    match_path = match_features.main(matcher_conf, sfm_pairs, feature_conf['output'], outputs_dir)
-
     if args.transforms_json is not None:
         if not args.transforms_json.exists() or not args.transforms_json.is_file():
             raise FileNotFoundError(f'transforms_json does not exist: {args.transforms_json}')
@@ -998,6 +1102,87 @@ def main() -> None:
             images_dir=images_dir,
             camera_model=args.camera_model,
         )
+
+    print('Extracting features...')
+    feature_path = extract_features.main(feature_conf, images_dir, outputs_dir)
+
+    if args.adjacent_matching:
+        print('Generating adjacent pairs for the rig to prevent symmetry mismatch...')
+        # Get sorted list of images from images_dir (recursive, relative paths)
+
+        image_paths = [
+
+            p for p in sorted(images_dir.rglob('*'))
+
+            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+
+        ]
+        names = [p.relative_to(images_dir).as_posix() for p in image_paths]
+
+
+
+        num_images = len(names)
+        if num_images < 2:
+
+            raise ValueError(f'Adjacent matching requires at least 2 images, got {num_images}.')
+
+        if num_images % 2 != 0:
+
+            raise ValueError(
+
+                'Adjacent matching requires an even number of images (top/bottom per location), '
+
+                f'got {num_images}.'
+
+            )
+
+        num_locations = num_images // 2
+        pairs: list[tuple[str, str]] = []
+
+        # 1. Vertical pairs (within same location)
+        for i in range(num_locations):
+            idx1 = 2 * i
+            idx2 = 2 * i + 1
+            if idx2 < num_images:
+                pairs.append((names[idx1], names[idx2]))
+                
+        # 2. Adjacent locations sequence determined from manual argument or dynamically from input transforms
+        if args.camera_order is not None:
+            spatial_order = args.camera_order
+            print(f"Using manual spatial camera location order: {spatial_order}")
+        else:
+            spatial_order = compute_spatial_order(transforms, names, num_locations)
+            print(f"Dynamically resolved spatial camera location order: {spatial_order}")
+        locations_pairs = [(spatial_order[k], spatial_order[k+1]) for k in range(len(spatial_order) - 1)]
+
+        for i, j in locations_pairs:
+            idx_i_top = 2 * i
+            idx_i_bot = 2 * i + 1
+            idx_j_top = 2 * j
+            idx_j_bot = 2 * j + 1
+            
+            cross_pairs = [
+                (idx_i_top, idx_j_top),
+                (idx_i_top, idx_j_bot),
+                (idx_i_bot, idx_j_top),
+                (idx_i_bot, idx_j_bot)
+            ]
+            
+            for idx1, idx2 in cross_pairs:
+                if idx1 < num_images and idx2 < num_images:
+                    pairs.append((names[idx1], names[idx2]))
+                    
+        # Write to sfm_pairs
+        with open(sfm_pairs, 'w') as f:
+            for name1, name2 in pairs:
+                f.write(f"{name1} {name2}\n")
+        print(f"Generated {len(pairs)} adjacent pairs for {num_images} images.")
+    else:
+        print('Generating exhaustive pairs for the rig...')
+        pairs_from_exhaustive.main(sfm_pairs, image_list=None, features=feature_path)
+
+    print('Matching features with LightGlue...')
+    match_path = match_features.main(matcher_conf, sfm_pairs, feature_conf['output'], outputs_dir)
 
     _validate_calibration_resolution(
         transforms=transforms,
@@ -1050,12 +1235,15 @@ def main() -> None:
         "ba_refine_focal_length": not args.lock_focus,
         "ba_refine_extra_params": not args.lock_params,
         "ba_refine_principal_point": args.refine_principle_point,
-
-        # General optimizations (for SIFT)
-        #"ba_global_function_tolerance": 1e-6, 
-        #"tri_merge_max_reproj_error": 1.5, # Default is often 4.0. Lowering to 1.5 or 1.0 forces surgical precision.
-        #"ba_global_max_num_iterations": 100, 
-        #"ba_local_max_num_iterations": 50
+        "mapper": {
+            "filter_min_tri_angle": args.filter_min_tri_angle,
+            "filter_max_reproj_error": args.filter_max_reproj_error,
+        },
+        "triangulation": {
+            "min_angle": args.filter_min_tri_angle,
+            "merge_max_reproj_error": args.filter_max_reproj_error,
+            "complete_max_reproj_error": args.filter_max_reproj_error,
+        }
     }
 
     if use_per_frame_intrinsics:
