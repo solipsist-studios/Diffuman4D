@@ -4,7 +4,9 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DATADIR=""
-IMAGE_EXT=".png"
+IMAGE_EXT=".webp"
+CAMERA_FORMAT="{0:04d}"
+CAMERA_COUNT=12
 ACTIONS=()
 ALL_ACTIONS=("remove_background" "carve_vhull" "predict_keypoints" "triangulate_skeleton" "draw_skeleton")
 
