@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import cv2
 import fire
 import torch
 import threading
@@ -64,49 +65,19 @@ def _keep_top_subject_bboxes(fmask: Image.Image, max_subjects: int) -> Image.Ima
     if not fg.any():
         return fmask
 
-    visited = np.zeros_like(fg, dtype=bool)
-    components = []
-    height, width = fg.shape
-
-    for y in range(height):
-        for x in range(width):
-            if not fg[y, x] or visited[y, x]:
-                continue
-
-            stack = [(y, x)]
-            visited[y, x] = True
-            size = 0
-            conf_sum = 0.0
-            min_y = max_y = y
-            min_x = max_x = x
-
-            while stack:
-                cy, cx = stack.pop()
-                size += 1
-                conf_sum += float(mask[cy, cx])
-                min_y = min(min_y, cy)
-                max_y = max(max_y, cy)
-                min_x = min(min_x, cx)
-                max_x = max(max_x, cx)
-
-                if cy > 0 and fg[cy - 1, cx] and not visited[cy - 1, cx]:
-                    visited[cy - 1, cx] = True
-                    stack.append((cy - 1, cx))
-                if cy + 1 < height and fg[cy + 1, cx] and not visited[cy + 1, cx]:
-                    visited[cy + 1, cx] = True
-                    stack.append((cy + 1, cx))
-                if cx > 0 and fg[cy, cx - 1] and not visited[cy, cx - 1]:
-                    visited[cy, cx - 1] = True
-                    stack.append((cy, cx - 1))
-                if cx + 1 < width and fg[cy, cx + 1] and not visited[cy, cx + 1]:
-                    visited[cy, cx + 1] = True
-                    stack.append((cy, cx + 1))
-
-            # Rank by total confidence so weak fragments are less likely to win.
-            components.append((conf_sum, size, min_y, max_y, min_x, max_x))
-
-    if not components:
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8), connectivity=4)
+    if num_labels <= 1:
         return fmask
+
+    conf_sums = np.bincount(labels.ravel(), weights=mask.ravel().astype(np.float64), minlength=num_labels)
+    components = []
+    for label in range(1, num_labels):
+        left = stats[label, cv2.CC_STAT_LEFT]
+        top = stats[label, cv2.CC_STAT_TOP]
+        width = stats[label, cv2.CC_STAT_WIDTH]
+        height = stats[label, cv2.CC_STAT_HEIGHT]
+        area = stats[label, cv2.CC_STAT_AREA]
+        components.append((conf_sums[label], area, top, top + height - 1, left, left + width - 1))
 
     components.sort(key=lambda c: (c[0], c[1]), reverse=True)
     keep = np.zeros_like(mask, dtype=bool)
