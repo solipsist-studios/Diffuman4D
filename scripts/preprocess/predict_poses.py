@@ -1097,19 +1097,23 @@ def main() -> None:
 
     if args.adjacent_matching:
         print('Generating adjacent pairs for the rig to prevent symmetry mismatch...')
-        # Get sorted list of images from images_dir
-        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
-        image_names = [
-            p.name for p in images_dir.iterdir()
-            if p.is_file() and p.suffix.lower() in image_extensions
+        # Get sorted list of images from images_dir (recursive, relative paths)
+        image_paths = [
+            p for p in sorted(images_dir.rglob('*'))
+            if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
         ]
-        
-        # Build adjacent locations mapping
-        names = sorted(image_names)
+        names = [p.relative_to(images_dir).as_posix() for p in image_paths]
+
         num_images = len(names)
+        if num_images < 2:
+            raise ValueError(f'Adjacent matching requires at least 2 images, got {num_images}.')
+        if num_images % 2 != 0:
+            raise ValueError(
+                'Adjacent matching requires an even number of images (top/bottom per location), '
+                f'got {num_images}.'
+            )
         num_locations = num_images // 2
-        pairs = []
-        
+        pairs: list[tuple[str, str]] = []
         # 1. Vertical pairs (within same location)
         for i in range(num_locations):
             idx1 = 2 * i
