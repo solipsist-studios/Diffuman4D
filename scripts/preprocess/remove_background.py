@@ -32,7 +32,8 @@ def load_model(model_name, device="cuda"):
     torch.set_float32_matmul_precision(["high", "highest"][0])
     model.to(device)
     model.eval()
-    model.half()
+    if torch.device(device).type == "cuda":
+        model.half()  # fp16 is a CUDA-only speedup here -- CPU doesn't reliably support it
     return model
 
 
@@ -41,7 +42,9 @@ def extract_object(images, model, sema):
     for image in images:
         input_image = transform_image(image)
         input_images.append(input_image)
-    input_images = torch.stack(input_images).to(model.device).half()
+    input_images = torch.stack(input_images).to(model.device)
+    if input_images.device.type == "cuda":
+        input_images = input_images.half()
 
     # batch inference
     with sema:
@@ -157,6 +160,12 @@ def remove_background(
     """
     if gpu_ids is None:
         gpu_ids = tuple(range(torch.cuda.device_count()))
+    # No CUDA GPU visible -- fall back to one CPU "device" rather than silently
+    # loading zero models below (the pre-fallback behavior: an empty gpu_ids
+    # tuple meant the model-loading loop never ran at all, producing no masks
+    # with no error). Same pattern already used by predict_keypoints.py's own
+    # CPU fallback (`device = ... if gpu_ids else "cpu"`).
+    devices = [f"cuda:{gpu_id}" for gpu_id in gpu_ids] if gpu_ids else ["cpu"]
 
     # prepare paths
     image_paths = sorted(glob(f"{images_dir}/**/*{image_ext}", recursive=True))
@@ -171,10 +180,10 @@ def remove_background(
     # load models
     models = []
     semas = []
-    for gpu_id in tqdm(gpu_ids, desc=f"Loading '{model_name}' to cuda:{gpu_ids}"):
-        model = load_model(model_name, f"cuda:{gpu_id}")
+    for device in tqdm(devices, desc=f"Loading '{model_name}' to {devices}"):
+        model = load_model(model_name, device)
         models.append(model)
-        # prevent CUDA OOM
+        # prevent CUDA OOM (on CPU this just serializes batches on the one model)
         sema = threading.Semaphore(1)
         semas.append(sema)
 
@@ -200,7 +209,7 @@ def remove_background(
         max_subjects,
         action=inference_batch,
         sequential=False,
-        num_workers=num_workers * len(gpu_ids),
+        num_workers=num_workers * len(devices),
         print_progress=True,
         desc="Predicting foreground masks",
     )
