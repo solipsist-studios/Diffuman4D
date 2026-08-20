@@ -34,6 +34,12 @@ def load_model(model_name, device="cuda"):
     model.eval()
     if torch.device(device).type == "cuda":
         model.half()  # fp16 is a CUDA-only speedup here -- CPU doesn't reliably support it
+    else:
+        # transformers 5 honors the checkpoint's own fp16 dtype at load
+        # (transformers 4 upcast to float32 silently), so on CPU the model
+        # arrives half and float32 inputs crash with a dtype mismatch.
+        # Cast back explicitly; skipping .half() alone is not enough.
+        model.float()
     return model
 
 
