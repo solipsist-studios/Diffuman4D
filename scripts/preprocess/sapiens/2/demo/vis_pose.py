@@ -93,6 +93,16 @@ def _detect_persons(image_bgr: np.ndarray, args) -> np.ndarray:
     return bboxes  # may be empty; callers handle empty via mask fallback or full-image fallback
 
 
+def _load_mask_file(mask_path: str, image_shape: tuple[int, int, int]) -> np.ndarray | None:
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None
+    h, w = image_shape[:2]
+    if mask.shape[:2] != (h, w):
+        mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+    return (mask > 0).astype(np.uint8)
+
+
 def _load_mask_for_image(mask_dir: str | None, image_name: str, image_shape: tuple[int, int, int]) -> np.ndarray | None:
     if not mask_dir:
         return None
@@ -100,13 +110,7 @@ def _load_mask_for_image(mask_dir: str | None, image_name: str, image_shape: tup
     for ext in _IMAGE_SUFFIXES:
         candidate = os.path.join(mask_dir, f"{stem}{ext}")
         if os.path.exists(candidate):
-            mask = cv2.imread(candidate, cv2.IMREAD_GRAYSCALE)
-            if mask is None:
-                return None
-            h, w = image_shape[:2]
-            if mask.shape[:2] != (h, w):
-                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
-            return (mask > 0).astype(np.uint8)
+            return _load_mask_file(candidate, image_shape)
     return None
 
 
@@ -646,6 +650,13 @@ def main():
         help="Disable saving per-video predictions JSON (saved by default).",
     )
     parser.add_argument(
+        "--save-vis",
+        action="store_true",
+        help="Also write a skeleton overlay image per input next to the JSON "
+             "(off by default: a full-resolution PNG encode per image that "
+             "nothing downstream reads; keep for debugging).",
+    )
+    parser.add_argument(
         "--predictions-name",
         default=None,
         help="Override predictions JSON filename (used by helper for per-chunk writes).",
@@ -673,6 +684,7 @@ def main():
     _get_detector(args.device, args.det_checkpoint)
 
     # Get image list
+    manifest_masks = {}
     if os.path.isdir(args.input):
         input_dir = args.input
         image_names = [
@@ -681,19 +693,32 @@ def main():
             if name.lower().endswith(_IMAGE_SUFFIXES)
         ]
     else:
+        # Manifest mode: one image per line, optionally followed by a tab and
+        # that image's foreground-mask path. Paths may live in different
+        # directories (for example one per frame of a sequence), so records
+        # carry the path as written rather than the basename, and the
+        # caller routes the JSON by that path. This is how a whole frame
+        # window runs through one model load.
         with open(args.input, "r") as f:
-            image_paths = [line.strip() for line in f if line.strip()]
-        image_names = [os.path.basename(path) for path in image_paths]
-        input_dir = os.path.dirname(image_paths[0])
+            manifest_rows = [line.rstrip("\n").split("\t") for line in f if line.strip()]
+        image_names = [row[0] for row in manifest_rows]
+        manifest_masks = {row[0]: row[1] for row in manifest_rows if len(row) > 1 and row[1]}
+        input_dir = None
 
     frames_records = []
     image_size = None
     num_keypoints_seen = None
 
     for image_name in tqdm(image_names, total=len(image_names)):
-        image_path = os.path.join(input_dir, image_name)
+        image_path = image_name if input_dir is None else os.path.join(input_dir, image_name)
         image = cv2.imread(image_path)
-        fg_mask = _load_mask_for_image(args.fmasks_dir, image_name, image.shape) if image is not None else None
+        if image is None:
+            print(f"[vis_pose] could not read {image_path}, skipping")
+            continue
+        if image_name in manifest_masks:
+            fg_mask = _load_mask_file(manifest_masks[image_name], image.shape)
+        else:
+            fg_mask = _load_mask_for_image(args.fmasks_dir, os.path.basename(image_name), image.shape)
 
         try:
             keypoints, keypoint_scores, bboxes = process_one_image(
@@ -708,22 +733,25 @@ def main():
         if num_keypoints_seen is None and len(keypoints) > 0:
             num_keypoints_seen = int(np.asarray(keypoints[0]).shape[0])
 
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        vis_image_rgb = visualize_keypoints(
-            image=image_rgb,
-            keypoints=keypoints,
-            keypoints_visible=np.ones_like(keypoint_scores) > 0,
-            keypoint_scores=keypoint_scores,
-            radius=args.radius,
-            thickness=args.thickness,
-            kpt_thr=args.kpt_thr,
-            skeleton=model.pose_metainfo["skeleton_links"],
-            kpt_color=model.pose_metainfo["keypoint_colors"],
-            link_color=model.pose_metainfo["skeleton_link_colors"],
-        )
-        vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
-        save_path = os.path.join(args.output, image_name)
-        cv2.imwrite(save_path, vis_image)
+        if args.save_vis:
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            vis_image_rgb = visualize_keypoints(
+                image=image_rgb,
+                keypoints=keypoints,
+                keypoints_visible=np.ones_like(keypoint_scores) > 0,
+                keypoint_scores=keypoint_scores,
+                radius=args.radius,
+                thickness=args.thickness,
+                kpt_thr=args.kpt_thr,
+                skeleton=model.pose_metainfo["skeleton_links"],
+                kpt_color=model.pose_metainfo["keypoint_colors"],
+                link_color=model.pose_metainfo["skeleton_link_colors"],
+            )
+            vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
+            # Manifest entries can be absolute paths; flatten them to a name.
+            vis_name = image_name if input_dir is not None else image_name.strip(os.sep).replace(os.sep, "__")
+            save_path = os.path.join(args.output, vis_name)
+            cv2.imwrite(save_path, vis_image)
 
         if not args.no_save_json:
             try:
