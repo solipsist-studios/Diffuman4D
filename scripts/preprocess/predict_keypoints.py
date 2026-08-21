@@ -286,8 +286,10 @@ def predict_keypoints(
     device = f"cuda:{gpu_ids[0]}" if gpu_ids else "cpu"
     cmd_parts.extend(["--device", device])
     
-    if save_img is not None:
-        print("Note: save_img is ignored for sapiens2; vis_pose.py always writes visualization images.")
+    # Skeleton overlay images are opt-in (vis_pose.py --save-vis); they are a
+    # full-resolution encode per image that no downstream stage reads.
+    if save_img:
+        cmd_parts.append("--save-vis")
 
     print(f"Running command from {os.path.dirname(__file__)}")
     print(f"Command: {' '.join(map(str, cmd_parts))}")
