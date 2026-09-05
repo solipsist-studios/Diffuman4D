@@ -3,7 +3,6 @@ import fire
 import json
 import torch
 import numpy as np
-import open3d as o3d
 from PIL import Image
 from plyfile import PlyData, PlyElement
 from torchvision.transforms.functional import to_tensor
