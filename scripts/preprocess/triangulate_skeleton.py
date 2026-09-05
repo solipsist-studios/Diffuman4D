@@ -348,10 +348,7 @@ def triangulate_skeleton(
     elif spa_labels_range is not None:
         b, e, s = spa_labels_range
         spa_labels = [format_spa_label(int(i)) for i in range(b, e, s)]
-    else:
-        def format_spa_label(i):
-            return f"{spa_label_prefix}{int(i):02d}"
-    
+
     if spa_labels is not None:
         if spa_labels_range is not None:
             raise ValueError("spa_labels and spa_labels_range cannot be specified together")
