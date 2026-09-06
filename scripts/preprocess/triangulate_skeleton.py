@@ -348,14 +348,6 @@ def triangulate_skeleton(
     elif spa_labels_range is not None:
         b, e, s = spa_labels_range
         spa_labels = [format_spa_label(int(i)) for i in range(b, e, s)]
-
-    if spa_labels is not None:
-        if spa_labels_range is not None:
-            raise ValueError("spa_labels and spa_labels_range cannot be specified together")
-        spa_labels = [format_spa_label(int(i)) for i in spa_labels]
-    elif spa_labels_range is not None:
-        b, e, s = spa_labels_range
-        spa_labels = [format_spa_label(int(i)) for i in range(b, e, s)]
     else:
         if kp2d_mode == "combined_json":
             spa_labels = combined_spa_labels
@@ -374,9 +366,6 @@ def triangulate_skeleton(
             spa_labels_proj = combined_spa_labels
         else:
             spa_labels_proj = sorted(os.listdir(kp2d_dir))
-
-    print(f"Using spatial labels: {spa_labels}")
-    print(f"Using spatial projection labels: {spa_labels_proj}")
 
     print(f"Using spatial labels: {spa_labels}")
     print(f"Using spatial projection labels: {spa_labels_proj}")
