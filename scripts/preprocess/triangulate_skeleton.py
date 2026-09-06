@@ -470,8 +470,12 @@ def triangulate_skeleton(
 
     def triangulate_one_skeleton(tem_label):
         out_kp3d_path = osp.join(out_kp3d_dir, f"{tem_label}.json")
-        out_pcd_path = osp.join(out_pcd_dir, f"{tem_label}.ply")
-        out_kp2d_proj_paths = [osp.join(out_kp2d_proj_dir, spa_label, f"{tem_label}.json") for spa_label in spa_labels_proj]
+        out_pcd_path = osp.join(out_pcd_dir, f"{tem_label}.ply") if out_pcd_dir is not None else None
+        out_kp2d_proj_paths = (
+            [osp.join(out_kp2d_proj_dir, spa_label, f"{tem_label}.json") for spa_label in spa_labels_proj]
+            if out_kp2d_proj_dir is not None
+            else []
+        )
 
         Ks, Ts = zip(*[_get_cam_mats(spa_label, tem_label) for spa_label in spa_labels])
         Ks_proj, Ts_proj = zip(*[_get_cam_mats(spa_label, tem_label) for spa_label in spa_labels_proj])
