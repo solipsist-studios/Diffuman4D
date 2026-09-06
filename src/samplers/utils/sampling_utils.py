@@ -11,6 +11,8 @@ from src.data.utils.image_utils import restore_cropped_image, denorm_vae_tensor
 from src.diffusers.pipelines.diffuman4d.pipeline_diffuman4d import Diffuman4DPipeline
 from src.utils import RankedLogger
 
+from diffusers.models import AutoencoderKL
+
 log = RankedLogger(__name__, rank_zero_only=True)
 
 
@@ -19,10 +21,17 @@ def load_pipelines(
     model_dir: str = "./models/krahets-Diffuman4D",
     torch_dtype: "str" = "bf16",
     gpu_ids: list[int] = None,
+    vae_batch_size: int = 8,
 ):
     if gpu_ids is None:
         gpu_ids = list(range(torch.cuda.device_count()))
         log.info(f"Found {len(gpu_ids)} CUDA devices.")
+
+    # If no GPUs are available, fall back to CPU so the function doesn't return an empty list.
+    # Use -1 as a sentinel value for CPU.
+    if len(gpu_ids) == 0:
+        log.warning("No CUDA devices found. Falling back to CPU (this may be slower and will use float32).")
+        gpu_ids = [-1]
 
     # download models
     if torch_dtype == "fp16":
@@ -42,12 +51,31 @@ def load_pipelines(
 
     # load models
     pipelines = []
+    # Keep the original torch dtype object for possible adjustment when running on CPU
+    dtype_to_use = torch_dtype
     for gpu_id in gpu_ids:
-        pipeline = Diffuman4DPipeline.from_pretrained(model_dir, torch_dtype=torch_dtype)
-        pipeline.to(f"cuda:{gpu_id}")
+        # If running on CPU, float16/bfloat16 may not be supported; force float32
+        use_dtype = dtype_to_use
+        if gpu_id == -1:
+            if use_dtype != torch.float32:
+                log.info("Forcing torch dtype to float32 for CPU target.")
+                use_dtype = torch.float32
+
+        pipeline = Diffuman4DPipeline.from_pretrained(model_dir, torch_dtype=use_dtype)
+
+        if gpu_id == -1:
+            pipeline.to("cpu")
+            device_str = "cpu"
+        else:
+            pipeline.to(f"cuda:{gpu_id}")
+            device_str = f"cuda:{gpu_id}"
+
         pipeline.set_progress_bar_config(disable=True)
+        pipeline.vae_batch_size = vae_batch_size
+        pipeline.vae.enable_slicing()
+        pipeline.vae.enable_tiling()
         pipelines.append(pipeline)
-        log.info(f"Loaded pipeline from {model_dir} of {torch_dtype} to cuda:{gpu_id}")
+        log.info(f"Loaded pipeline from {model_dir} of {use_dtype} to {device_str}")
     return pipelines
 
 
@@ -61,58 +89,73 @@ def save_sampling_results(
     image_quality: int = 90,
     max_image_size: int = 8192,
 ):
-    output_images = sample["images"]
-    input_indices = sample["input_indices"]
-    target_indices = sample["target_indices"]
-    input_images = denorm_vae_tensor(sample["pixel_values"])
+    try:
+        output_images = sample["images"]
+        input_indices = sample["input_indices"]
+        target_indices = sample["target_indices"]
+        input_images = denorm_vae_tensor(sample["pixel_values"])
 
-    # save snapshots
-    if save_image_grid:
-        # calculate L1 error
-        image_errors = (output_images - input_images).abs().clamp(0, 1)
-        # transparent the input images
-        output_images[input_indices, ...] *= 0.2
+        # save snapshots
+        if save_image_grid:
+            # calculate L1 error
+            image_errors = (output_images - input_images).abs().clamp(0, 1)
+            # transparent the input images
+            output_images[input_indices, ...] *= 0.2
 
-        if sample["skeletons"] is not None:
-            # blend skeletons with images
-            skeletons = denorm_vae_tensor(sample["skeletons"])
-            skeletons = skeletons * 0.8 + input_images * 0.2
-            image_grid = torch.cat([skeletons, input_images, output_images, image_errors])
-        else:
-            image_grid = torch.cat([input_images, output_images, image_errors])
+            if sample["skeletons"] is not None:
+                # blend skeletons with images
+                skeletons = denorm_vae_tensor(sample["skeletons"])
+                skeletons = skeletons * 0.8 + input_images * 0.2
+                image_grid = torch.cat([skeletons, input_images, output_images, image_errors])
+            else:
+                image_grid = torch.cat([input_images, output_images, image_errors])
 
-        # downscale the image grid and use .webp to save disk space
-        max_size = min(
-            max_image_size // len(output_images),
-            max(image_grid.shape[-2:]),
-        )
-        image_grid = resize(image_grid, max_size)
+            # downscale the image grid and use .webp to save disk space
+            max_size = min(
+                max_image_size // len(output_images),
+                max(image_grid.shape[-2:]),
+            )
+            image_grid = resize(image_grid, max_size)
 
-        image_grid_path = f'{output_dir}/grids/alt{sample["alt"]}_{"spa" if sample["domain"] == "temporal" else "tem"}{sample["domain_label"]}.webp'
-        os.makedirs(osp.dirname(image_grid_path), exist_ok=True)
-        save_grid(image_grid, image_grid_path, nrow=len(output_images), padding=2, pad_value=0)
+            image_grid_path = f'{output_dir}/grids/alt{sample["alt"]}_{"spa" if sample["domain"] == "temporal" else "tem"}{sample["domain_label"]}.webp'
+            os.makedirs(osp.dirname(image_grid_path), exist_ok=True)
+            save_grid(image_grid, image_grid_path, nrow=len(output_images), padding=2, pad_value=0)
+            
+            # Free memory after grid is saved
+            del image_grid
+            if sample["skeletons"] is not None:
+                del skeletons
+
+    except Exception as e:
+        log.error(f"Error in save_sampling_results: {str(e)}")
+        log.error(f"Sample keys: {sample.keys()}")
+        log.error(f"Output images shape: {output_images.shape if hasattr(output_images, 'shape') else 'N/A'}")
+        raise
 
     # save the images and crops
     output_images[input_indices] = input_images[input_indices]
     for i, (output_image, crop, (_, spa_label, tem_label)) in enumerate(
         zip(output_images, sample["crops"], sample["labels"])
     ):
-        if save_output_image:
-            image_path = f"{output_dir}/images/{spa_label}/{tem_label}{image_ext}"
-            # skip the noised target images
-            if not sample["fully_denoised"][i] and i in target_indices:
-                continue
-            # skip the saved images (input images)
-            if osp.isfile(image_path):
-                continue
+        try:
+            if save_output_image:
+                image_path = f"{output_dir}/images/{spa_label}/{tem_label}{image_ext}"
+                # skip the noised target images
+                if not sample["fully_denoised"][i] and i in target_indices:
+                    continue
+                # skip the saved images (input images)
+                if osp.isfile(image_path):
+                    continue
 
-            image = to_pil_image(output_image)
-            image = restore_cropped_image(image, crop)
-            save_image(path=image_path, image=image, quality=image_quality)
+                image = to_pil_image(output_image)
+                image = restore_cropped_image(image, crop)
+                save_image(path=image_path, image=image, quality=image_quality)
 
-        if save_crop_param:
-            save_json(path=f"{output_dir}/crops/{spa_label}/{tem_label}.json", data=crop)
-
+            if save_crop_param:
+                save_json(path=f"{output_dir}/crops/{spa_label}/{tem_label}.json", data=crop)
+        except Exception as e:
+            log.error(f"Error saving image {i} ({spa_label}/{tem_label}): {str(e)}")
+            raise
 
 def check_sampling_results(spa_labels, tem_labels, output_dir: str):
     # check saved images

@@ -1,7 +1,10 @@
+from __future__ import annotations
 import os
+import cv2
 import fire
 import torch
 import threading
+import numpy as np
 from PIL import Image
 from glob import glob
 from torchvision import transforms
@@ -29,7 +32,14 @@ def load_model(model_name, device="cuda"):
     torch.set_float32_matmul_precision(["high", "highest"][0])
     model.to(device)
     model.eval()
-    model.half()
+    if torch.device(device).type == "cuda":
+        model.half()  # fp16 is a CUDA-only speedup here -- CPU doesn't reliably support it
+    else:
+        # transformers 5 honors the checkpoint's own fp16 dtype at load
+        # (transformers 4 upcast to float32 silently), so on CPU the model
+        # arrives half and float32 inputs crash with a dtype mismatch.
+        # Cast back explicitly; skipping .half() alone is not enough.
+        model.float()
     return model
 
 
@@ -38,7 +48,9 @@ def extract_object(images, model, sema):
     for image in images:
         input_image = transform_image(image)
         input_images.append(input_image)
-    input_images = torch.stack(input_images).to(model.device).half()
+    input_images = torch.stack(input_images).to(model.device)
+    if input_images.device.type == "cuda":
+        input_images = input_images.half()
 
     # batch inference
     with sema:
@@ -53,7 +65,39 @@ def extract_object(images, model, sema):
     return fmasks
 
 
-def inference_batch(image_paths, fmask_paths, image_alpha_paths, model, sema, rotate_clockwise, skip_exists):
+def _keep_top_subject_bboxes(fmask: Image.Image, max_subjects: int) -> Image.Image:
+    if max_subjects <= 0:
+        return Image.new("L", fmask.size, 0)
+
+    mask = np.asarray(fmask, dtype=np.uint8)
+    fg = mask > 0
+    if not fg.any():
+        return fmask
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8), connectivity=4)
+    if num_labels <= 1:
+        return fmask
+
+    conf_sums = np.bincount(labels.ravel(), weights=mask.ravel().astype(np.float32), minlength=num_labels)
+    components = []
+    for label in range(1, num_labels):
+        left = stats[label, cv2.CC_STAT_LEFT]
+        top = stats[label, cv2.CC_STAT_TOP]
+        width = stats[label, cv2.CC_STAT_WIDTH]
+        height = stats[label, cv2.CC_STAT_HEIGHT]
+        area = stats[label, cv2.CC_STAT_AREA]
+        components.append((conf_sums[label], area, top, top + height - 1, left, left + width - 1))
+
+    components.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    keep = np.zeros_like(mask, dtype=bool)
+    for _, _, min_y, max_y, min_x, max_x in components[:max_subjects]:
+        keep[min_y : max_y + 1, min_x : max_x + 1] = True
+
+    filtered_mask = np.where(keep, mask, 0).astype(np.uint8)
+    return Image.fromarray(filtered_mask, mode="L")
+
+
+def inference_batch(image_paths, fmask_paths, image_alpha_paths, model, sema, rotate_clockwise, skip_exists, max_subjects):
     if skip_exists:
         is_completed = True
         for fmask_path in fmask_paths:
@@ -81,6 +125,8 @@ def inference_batch(image_paths, fmask_paths, image_alpha_paths, model, sema, ro
     fmasks = extract_object(images, model, sema)
 
     for image, fmask, fmask_path, image_alpha_path in zip(images, fmasks, fmask_paths, image_alpha_paths):
+        if max_subjects is not None:
+            fmask = _keep_top_subject_bboxes(fmask, max_subjects)
         if rotate_clockwise != 0:
             fmask = fmask.rotate(rotate_clockwise, expand=True)
         os.makedirs(os.path.dirname(fmask_path), exist_ok=True)
@@ -101,6 +147,7 @@ def remove_background(
     image_ext: str = ".webp",
     mask_ext: str = ".png",
     rotate_clockwise: int = 0,
+    max_subjects: int | None = None,
     batch_size: int = 8,
     num_workers: int = 4,
     skip_exists: bool = False,
@@ -113,12 +160,18 @@ def remove_background(
         model_name: str
             "briaai/RMBG-2.0": for general background removal.
             "ZhengPeng7/BiRefNet": for general background removal.
-            "ZhengPeng7/BiRefNet": for human segmentation.
+            "ZhengPeng7/BiRefNet-portrait": for human segmentation.
         batch_size: int
             The number of images to process in a single batch. Recommended to be GPU memory // 2.
     """
     if gpu_ids is None:
         gpu_ids = tuple(range(torch.cuda.device_count()))
+    # No CUDA GPU visible -- fall back to one CPU "device" rather than silently
+    # loading zero models below (the pre-fallback behavior: an empty gpu_ids
+    # tuple meant the model-loading loop never ran at all, producing no masks
+    # with no error). Same pattern already used by predict_keypoints.py's own
+    # CPU fallback (`device = ... if gpu_ids else "cpu"`).
+    devices = [f"cuda:{gpu_id}" for gpu_id in gpu_ids] if gpu_ids else ["cpu"]
 
     # prepare paths
     image_paths = sorted(glob(f"{images_dir}/**/*{image_ext}", recursive=True))
@@ -133,10 +186,10 @@ def remove_background(
     # load models
     models = []
     semas = []
-    for gpu_id in tqdm(gpu_ids, desc=f"Loading '{model_name}' to cuda:{gpu_ids}"):
-        model = load_model(model_name, f"cuda:{gpu_id}")
+    for device in tqdm(devices, desc=f"Loading '{model_name}' to {devices}"):
+        model = load_model(model_name, device)
         models.append(model)
-        # prevent CUDA OOM
+        # prevent CUDA OOM (on CPU this just serializes batches on the one model)
         sema = threading.Semaphore(1)
         semas.append(sema)
 
@@ -159,9 +212,10 @@ def remove_background(
         semas_batch,
         rotate_clockwise,
         skip_exists,
+        max_subjects,
         action=inference_batch,
         sequential=False,
-        num_workers=num_workers * len(gpu_ids),
+        num_workers=num_workers * len(devices),
         print_progress=True,
         desc="Predicting foreground masks",
     )
